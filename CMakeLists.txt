@@ -1,10 +1,24 @@
 cmake_minimum_required(VERSION 3.10)
-project(SNES_Emulator)
+project(SuperFuramicom)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Gather all source files
-file(GLOB SOURCES "*.cpp")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 
+# Find SDL2
+find_package(SDL2 REQUIRED)
+
+file(GLOB SOURCES "*.cpp")
 add_executable(snes_emu ${SOURCES})
+
+target_include_directories(snes_emu PRIVATE ${SDL2_INCLUDE_DIRS})
+target_link_libraries(snes_emu ${SDL2_LIBRARIES})
+
+if(TARGET SDL2::SDL2)
+    target_link_libraries(snes_emu SDL2::SDL2)
+endif()
