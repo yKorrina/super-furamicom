@@ -37,7 +37,10 @@ private:
     DMAChannel dma[8];
     void executeDMA(uint8_t channels);
     
-    bool nmi_enabled; // The interrupt switch
+    bool nmi_enabled; 
+    
+    // Fake Audio Chip memory to satisfy the boot handshake
+    uint8_t apu_ports[4]; 
 };
 
 #endif // BUS_HPP

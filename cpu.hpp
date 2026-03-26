@@ -2,6 +2,7 @@
 #define CPU_HPP
 
 #include <cstdint>
+#include <fstream> 
 
 class Bus;
 
@@ -17,6 +18,7 @@ public:
     };
 
     CPU();
+    ~CPU(); 
     void connectBus(Bus* b);
     void reset();
     uint8_t step();
@@ -39,6 +41,9 @@ private:
 
     Instruction instruction_table[256];
 
+    std::ofstream log_file;
+    uint64_t instruction_count;
+
     void setFlag(uint8_t flag, bool value);
     bool getFlag(uint8_t flag);
 
@@ -54,8 +59,10 @@ private:
 
     // Addressing Modes
     void IMP();   
-    void ACC();   // Accumulator Mode
+    void ACC();   
     void AL();   
+    void ALX();           // Absolute Long Indexed X
+    void DP_IND_Y_LONG(); // [Direct Page], Y
     void IMM8();  
     void IMM16(); 
     void ABS();   
@@ -65,25 +72,31 @@ private:
     void IMM_M(); 
     void IMM_X(); 
     void REL();   
+    void REL16(); 
 
     // Opcodes
     void INC(); void DEC(); void INA(); void DEA(); 
+    void INX(); void INY(); void DEX(); void DEY(); 
     void JSR(); void RTS(); void RTL(); void RTI(); 
     void LDA(); void ADC(); void NOP(); void LDX(); void LDY();
-    void STA(); void TXS(); void DEX(); void BNE();
+    void STA(); void STX(); void STY(); void TXS(); void BNE();
     void JMP(); void JML(); void JSL(); void STZ();  
+    
+    void PHA(); void PLA(); void PHX(); void PLX(); void PHY(); void PLY();
     void PHK(); void PHP(); void PLP(); void PHB(); void PLB();  
+    void PHD(); void PLD(); void PEA(); void PEI(); void PER(); 
+    
     void TCD(); void TCS(); void EOR(); void CPX(); void CPY();
     void SBC(); void AND(); void ORA(); void BIT(); void CMP();
-    void BRA(); void BEQ(); void BCC(); void BCS(); 
+    void BRA(); void BRL(); void BEQ(); void BCC(); void BCS(); 
     void BPL(); void BMI(); void BVC(); void BVS(); 
     void XBA(); 
 
-    // New Transfers & Shifts
     void TAX(); void TAY(); void TXA(); void TYA(); void TSX();
     void ASL_A(); void LSR_A();
+    
+    void MVN(); void MVP(); // Block Moves
 
-    // Boot Opcodes
     void SEI(); void CLC(); void XCE(); void REP(); void SEP();
     
     void buildInstructionTable();

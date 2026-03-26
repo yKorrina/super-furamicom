@@ -6,6 +6,12 @@ Bus::Bus(CPU* c, PPU* p, APU* a) : cpu(c), ppu(p), apu(a) {
     cpu->connectBus(this);
     wram.resize(128 * 1024, 0); 
     nmi_enabled = false;
+    
+    // Fake APU boot sequence starting values
+    apu_ports[0] = 0xAA;
+    apu_ports[1] = 0xBB;
+    apu_ports[2] = 0x00;
+    apu_ports[3] = 0x00;
 }
 
 void Bus::insertCartridge(Cartridge* cart) { cartridge = cart; }
@@ -14,15 +20,20 @@ uint8_t Bus::read(uint32_t address) {
     uint8_t bank = (address >> 16) & 0xFF;
     uint16_t offset = address & 0xFFFF;
 
+    // 1. WRAM Access
     if (bank == 0x7E || bank == 0x7F) return wram[((bank & 1) << 16) | offset];
     if ((bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)) && offset < 0x2000) return wram[offset];
 
+    // 2. Hardware Registers
     if (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)) {
         if (offset >= 0x2100 && offset <= 0x213F) return ppu->readRegister(offset);
         
-        if (offset == 0x2140) return 0xAA; // Fake APU Boot Sync
-        if (offset == 0x2141) return 0xBB;
+        // APU Port Echo (Allows the handshake to complete)
+        if (offset >= 0x2140 && offset <= 0x2143) {
+            return apu_ports[offset - 0x2140];
+        }
         
+        // Universal Hardware Polling Bypass
         if (offset >= 0x4200 && offset <= 0x437F) {
             static uint8_t hw_toggle = 0;
             hw_toggle += 0x13; 
@@ -44,6 +55,12 @@ void Bus::write(uint32_t address, uint8_t data) {
     if (bank <= 0x3F || (bank >= 0x80 && bank <= 0xBF)) {
         if (offset >= 0x2100 && offset <= 0x213F) { ppu->writeRegister(offset, data); return; }
 
+        // Echo writes back to the fake APU ports
+        if (offset >= 0x2140 && offset <= 0x2143) {
+            apu_ports[offset - 0x2140] = data;
+            return;
+        }
+
         if (offset == 0x4200) { nmi_enabled = (data & 0x80) != 0; return; }
         if (offset == 0x420B) { executeDMA(data); return; }
 
@@ -54,7 +71,7 @@ void Bus::write(uint32_t address, uint8_t data) {
                 case 0x00: dma[channel].control = data; break;
                 case 0x01: dma[channel].dest_reg = data; break;
                 
-                // FIXED: Using correct 24-bit masks so the Bank byte is not destroyed
+                // CRITICAL FIX: 24-bit Address Masks (Prevents stripping the bank ID)
                 case 0x02: dma[channel].src_address = (dma[channel].src_address & 0xFFFF00) | data; break;
                 case 0x03: dma[channel].src_address = (dma[channel].src_address & 0xFF00FF) | (data << 8); break;
                 case 0x04: dma[channel].src_address = (dma[channel].src_address & 0x00FFFF) | (data << 16); break;
@@ -73,7 +90,7 @@ void Bus::executeDMA(uint8_t channels) {
             uint8_t mode = dma[i].control & 0x07;
             uint16_t bytes_transferred = 0;
             
-            // FIXED: SNES transfers 65536 bytes if size is set to 0
+            // SNES Quirks: Transferring "0" bytes actually means transferring 65,536 bytes
             int transfer_size = (dma[i].size == 0) ? 0x10000 : dma[i].size;
             
             std::cout << "[DMA] Ch " << i << " -> Reg 0x21" << std::hex << (int)dma[i].dest_reg 
@@ -91,7 +108,7 @@ void Bus::executeDMA(uint8_t channels) {
                 transfer_size--;
                 bytes_transferred++;
             }
-            dma[i].size = 0; // Reset size after transfer
+            dma[i].size = 0; // Clear the size register after transfer
         }
     }
 }
