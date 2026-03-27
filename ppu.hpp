@@ -17,17 +17,40 @@ public:
     bool getVBlank() const { return vblank_flag; }
 
     const uint32_t* getFramebuffer() const { return framebuffer.data(); }
-    uint8_t getINIDISP() const { return inidisp; }
-    uint8_t getBGMode() const { return bgmode; }
-    uint8_t getTMMain() const { return tm_main; }
-    uint8_t getTMSub() const { return tm_sub; }
-    uint8_t getVMAIN() const { return vmain; }
-    uint16_t getVRAMAddress() const { return vram_address; }
-    uint8_t getCGRAMAddress() const { return cgram_address; }
-    uint16_t getOAMAddress() const { return oam_address; }
-    size_t countNonZeroVRAM() const;
-    size_t countNonZeroCGRAM() const;
-    size_t countNonZeroOAM() const;
+
+    // ── Accessors for debug / visualizer ──────────────────────────────────
+    uint8_t  getINIDISP()      const { return inidisp; }
+    uint8_t  getBGMode()       const { return bgmode; }
+    uint8_t  getTMMain()       const { return tm_main; }
+    uint8_t  getTMSub()        const { return tm_sub; }
+    uint8_t  getTMW()          const { return tmw_main; }
+    uint8_t  getTSW()          const { return tsw_sub; }
+    uint8_t  getVMAIN()        const { return vmain; }
+    uint8_t  getCGWSEL()       const { return cgwsel; }
+    uint8_t  getCGADSUB()      const { return cgadsub; }
+    uint16_t getFixedColor()   const { return fixed_color; }
+    uint16_t getVRAMAddress()  const { return vram_address; }
+    uint8_t  getCGRAMAddress() const { return cgram_address; }
+    uint16_t getOAMAddress()   const { return oam_address; }
+
+    // Raw data access for visualizer
+    const uint8_t* getVRAMData()  const { return vram.data(); }
+    const uint8_t* getCGRAMData() const { return cgram.data(); }
+    const uint8_t* getOAMData()   const { return oam.data(); }
+    size_t getVRAMSize()  const { return vram.size(); }
+    size_t getCGRAMSize() const { return cgram.size(); }
+    size_t getOAMSize()   const { return oam.size(); }
+
+    // BG register access for visualizer
+    uint8_t  getBGSC(int n)   const { return (n >= 0 && n < 4) ? bg_sc[n] : 0; }
+    uint8_t  getBGNBA(int n)  const { return (n >= 0 && n < 2) ? bg_nba[n] : 0; }
+    uint16_t getBGHOFS(int n) const { return (n >= 0 && n < 4) ? bg_hofs[n] : 0; }
+    uint16_t getBGVOFS(int n) const { return (n >= 0 && n < 4) ? bg_vofs[n] : 0; }
+
+    // Debug counters
+    size_t countNonZeroVRAM()    const;
+    size_t countNonZeroCGRAM()   const;
+    size_t countNonZeroOAM()     const;
     size_t countNonBlackPixels() const;
 
 private:
@@ -52,8 +75,14 @@ private:
     uint16_t bg_hofs[4];
     uint16_t bg_vofs[4];
     uint8_t  bg_scroll_latch;    
+    uint8_t  bg_hofs_latch;
     uint8_t  tm_main;
     uint8_t  tm_sub;
+    uint8_t  tmw_main;
+    uint8_t  tsw_sub;
+    uint8_t  cgwsel;
+    uint8_t  cgadsub;
+    uint16_t fixed_color;
 
     uint8_t  obsel;
     uint8_t  inidisp;
@@ -70,11 +99,9 @@ private:
 
     std::array<uint32_t, 256 * 224> framebuffer;
 
-    // VRAM address translation (bits 2-3 of VMAIN)
     uint16_t translateVRAMAddress(uint16_t addr);
-
-    void renderBG(int bg_num, int bpp);
-    void renderSprites();
+    void renderBG(int bg_num, int bpp, bool high_priority, uint32_t* target, uint8_t* source);
+    void renderSprites(int priority, uint32_t* target, uint8_t* source);
     uint32_t colorFromCGRAM(uint16_t palette_offset);
 };
 

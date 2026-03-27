@@ -42,10 +42,6 @@ private:
     
     bool nmi_enabled; 
     
-    uint8_t apu_spc_to_cpu[4];
-    uint8_t apu_cpu_to_spc[4];
-    uint8_t  ipl_last_port0;
-    bool     ipl_in_transfer;
     void     handleAPUWrite(uint8_t port, uint8_t data);
 
     uint16_t joy1_state = 0;
