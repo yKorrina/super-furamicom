@@ -32,6 +32,7 @@ void CPU::reset() {
     PB = 0x00; DB = 0x00; D = 0x0000;
     SP = 0x01FF; P = 0x34; E = true;
     halted = false;
+    waiting_for_interrupt = false;
     PC = read16(0x00FFFC);
     cycles_remaining = 8;
 
@@ -48,6 +49,7 @@ void CPU::reset() {
 
 uint8_t CPU::step() {
     if (halted) return 1;
+    if (waiting_for_interrupt) return 1;
 
     uint32_t pc_full = ((uint32_t)PB << 16) | PC;
     fetched_opcode = read8(pc_full);
@@ -70,23 +72,6 @@ uint8_t CPU::step() {
     }
     instruction_count++;
 
-    // ── Infinite loop detection ──────────────────────────────────────────────
-    if (pc_full == prev_pc_full) {
-        same_pc_count++;
-        if (same_pc_count > 100) {
-            halted = true;
-            if (trace_enabled) {
-                log_file << "# HALT: Infinite loop detected at $" 
-                         << std::hex << pc_full << std::dec << "\n";
-                log_file.flush();
-            }
-            return 1;
-        }
-    } else {
-        same_pc_count = 0;
-        prev_pc_full = pc_full;
-    }
-
     PC++;
 
     Instruction& instr = instruction_table[fetched_opcode];
@@ -102,6 +87,7 @@ void CPU::printState() {}
 
 void CPU::nmi() {
     if (halted) return;
+    waiting_for_interrupt = false;
     push8(PB);
     push16(PC);
     push8(P);
@@ -754,8 +740,7 @@ void CPU::STP() {
 }
 
 void CPU::WAI() {
-    // WAI waits for an interrupt — for now, just return immediately
-    // (the next NMI will wake it up)
+    waiting_for_interrupt = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

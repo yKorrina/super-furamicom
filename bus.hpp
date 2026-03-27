@@ -25,8 +25,10 @@ public:
     void insertCartridge(Cartridge* cart);
 
     bool isNMIEnabled() const { return nmi_enabled; }
-
     void setJoypadState(uint16_t pad1, uint16_t pad2);
+
+    // Save SRAM to disk
+    void saveSRAM();
 
 private:
     CPU* cpu;
@@ -40,28 +42,10 @@ private:
     
     bool nmi_enabled; 
     
-    // ══════════════════════════════════════════════════════════════════════════
-    //  APU Port Architecture — how the REAL SNES works:
-    //
-    //  Ports $2140-$2143 are DUAL-PORTED registers:
-    //    CPU WRITE  → apu_cpu_to_spc[0..3]   (SPC700 would read these)
-    //    CPU READ   ← apu_spc_to_cpu[0..3]   (SPC700 would write these)
-    //
-    //  They are NOT the same registers!  A CPU write to $2140 does NOT
-    //  change what the CPU reads back from $2140.  On real hardware the
-    //  SPC700 controls the read-side values.
-    //
-    //  Since we don't emulate the SPC700, we run a tiny state machine
-    //  that fakes the IPL boot protocol so games can finish their
-    //  audio-program upload handshake and move on.
-    // ══════════════════════════════════════════════════════════════════════════
-    uint8_t apu_spc_to_cpu[4];   // CPU reads from these
-    uint8_t apu_cpu_to_spc[4];   // CPU writes to these
-    
-    // Fake IPL boot protocol state
-    enum class IPLState { WAIT_BEGIN, TRANSFERRING, DONE };
-    IPLState ipl_state;
-    uint8_t  ipl_expected_counter;
+    uint8_t apu_spc_to_cpu[4];
+    uint8_t apu_cpu_to_spc[4];
+    uint8_t  ipl_last_port0;
+    bool     ipl_in_transfer;
     void     handleAPUWrite(uint8_t port, uint8_t data);
 
     uint16_t joy1_state = 0;
@@ -77,4 +61,4 @@ private:
     uint8_t  open_bus = 0;
 };
 
-#endif // BUS_HPP
+#endif

@@ -32,6 +32,15 @@ public:
 
     // Check if CPU is halted (STP/WAI/infinite loop detection)
     bool isHalted() const { return halted; }
+    uint32_t getProgramCounter() const { return ((uint32_t)PB << 16) | PC; }
+    uint16_t getA() const { return A; }
+    uint16_t getX() const { return X; }
+    uint16_t getY() const { return Y; }
+    uint16_t getSP() const { return SP; }
+    uint16_t getD() const { return D; }
+    uint8_t getDB() const { return DB; }
+    uint8_t getP() const { return P; }
+    bool isEmulationMode() const { return E; }
 
 private:
     Bus* bus;
@@ -47,6 +56,7 @@ private:
     uint8_t  cycles_remaining;
 
     bool halted = false;
+    bool waiting_for_interrupt = false;
 
     Instruction instruction_table[256];
 
@@ -54,10 +64,6 @@ private:
     uint64_t instruction_count;
     uint64_t max_trace_lines;
     bool     trace_enabled;
-
-    // Infinite loop detection
-    uint32_t prev_pc_full = 0;
-    int      same_pc_count = 0;
 
     void setFlag(uint8_t flag, bool value);
     bool getFlag(uint8_t flag);

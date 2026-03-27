@@ -17,6 +17,18 @@ public:
     bool getVBlank() const { return vblank_flag; }
 
     const uint32_t* getFramebuffer() const { return framebuffer.data(); }
+    uint8_t getINIDISP() const { return inidisp; }
+    uint8_t getBGMode() const { return bgmode; }
+    uint8_t getTMMain() const { return tm_main; }
+    uint8_t getTMSub() const { return tm_sub; }
+    uint8_t getVMAIN() const { return vmain; }
+    uint16_t getVRAMAddress() const { return vram_address; }
+    uint8_t getCGRAMAddress() const { return cgram_address; }
+    uint16_t getOAMAddress() const { return oam_address; }
+    size_t countNonZeroVRAM() const;
+    size_t countNonZeroCGRAM() const;
+    size_t countNonZeroOAM() const;
+    size_t countNonBlackPixels() const;
 
 private:
     std::vector<uint8_t> vram;   
@@ -29,9 +41,8 @@ private:
     bool     cgram_latch;
     uint8_t  cgram_buffer;
 
-    // OAM address and write latch
     uint16_t oam_address;
-    uint16_t oam_write_address;  // internal address that auto-increments
+    uint16_t oam_write_address;
     bool     oam_latch;
     uint8_t  oam_buffer;
 
@@ -44,20 +55,23 @@ private:
     uint8_t  tm_main;
     uint8_t  tm_sub;
 
-    // Object (sprite) settings
-    uint8_t  obsel;  // $2101 — OBJ size select & name base address
+    uint8_t  obsel;
+    uint8_t  inidisp;
 
-    // Screen settings
-    uint8_t  inidisp;  // $2100 — forced blank & brightness
-
-    // VRAM read prefetch
     uint16_t vram_prefetch;
+
+    // Mode 7 registers
+    uint16_t m7a, m7b, m7c, m7d;
+    uint32_t mpy_result;  // 24-bit signed multiply result
+
+    // Latch registers  
+    uint16_t ophct, opvct;
+    bool     ophct_latch, opvct_latch;
 
     bool vblank_flag = false;
 
     std::array<uint32_t, 256 * 224> framebuffer;
 
-    // Rendering helpers
     void renderBG(int bg_num, int bpp);
     void renderSprites();
     uint32_t colorFromCGRAM(uint16_t palette_offset);
