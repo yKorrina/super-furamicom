@@ -13,10 +13,11 @@ set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 # Find SDL2
 find_package(SDL2 REQUIRED)
 
-file(GLOB SOURCES "*.cpp")
+# Source files in src/ directory
+file(GLOB SOURCES "src/*.cpp")
 add_executable(snes_emu ${SOURCES})
 
-target_include_directories(snes_emu PRIVATE ${SDL2_INCLUDE_DIRS})
+target_include_directories(snes_emu PRIVATE src ${SDL2_INCLUDE_DIRS})
 target_link_libraries(snes_emu ${SDL2_LIBRARIES})
 
 if(TARGET SDL2::SDL2)

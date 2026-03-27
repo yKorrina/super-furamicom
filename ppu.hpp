@@ -60,17 +60,18 @@ private:
 
     uint16_t vram_prefetch;
 
-    // Mode 7 registers
     uint16_t m7a, m7b, m7c, m7d;
-    uint32_t mpy_result;  // 24-bit signed multiply result
+    uint32_t mpy_result;
 
-    // Latch registers  
     uint16_t ophct, opvct;
     bool     ophct_latch, opvct_latch;
 
     bool vblank_flag = false;
 
     std::array<uint32_t, 256 * 224> framebuffer;
+
+    // VRAM address translation (bits 2-3 of VMAIN)
+    uint16_t translateVRAMAddress(uint16_t addr);
 
     void renderBG(int bg_num, int bpp);
     void renderSprites();

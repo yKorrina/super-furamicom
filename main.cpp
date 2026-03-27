@@ -5,9 +5,27 @@
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
+#include <cstdint>
 #include <SDL2/SDL.h>
 
-class APU {}; 
+class APU {
+public:
+    static constexpr int kOutputHz = 32040;
+
+    void mix(int16_t* stream, int stereo_frames) {
+        std::memset(stream, 0, stereo_frames * 2 * sizeof(int16_t));
+    }
+};
+
+static void SDLAudioCallback(void* userdata, Uint8* stream, int len) {
+    auto* apu = static_cast<APU*>(userdata);
+    if (!apu) {
+        std::memset(stream, 0, len);
+        return;
+    }
+
+    apu->mix(reinterpret_cast<int16_t*>(stream), len / (int)sizeof(int16_t) / 2);
+}
 
 class System {
 public:
@@ -83,6 +101,7 @@ public:
 
     bool isCPUHalted() const { return cpu.isHalted(); }
     const uint32_t* getFramebuffer() const { return ppu.getFramebuffer(); }
+    APU* getAPU() { return &apu; }
     void dumpDebugState(std::ostream& out) const {
         out << "[CPU] PC=" << std::hex << cpu.getProgramCounter()
             << " A=" << cpu.getA()
@@ -181,7 +200,7 @@ int main(int argc, char* argv[]) {
         return snes.isCPUHalted() ? 2 : 0;
     }
 
-    SDL_Init(SDL_INIT_VIDEO);
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
     
     SDL_Window* window = SDL_CreateWindow(
         "Super Furamicom",
@@ -190,21 +209,41 @@ int main(int argc, char* argv[]) {
         SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
 
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, 
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    }
     SDL_RenderSetLogicalSize(renderer, 256, 224);
     
     SDL_Texture* texture = SDL_CreateTexture(
         renderer, SDL_PIXELFORMAT_ARGB8888, 
         SDL_TEXTUREACCESS_STREAMING, 256, 224
     );
+
+    SDL_AudioSpec desired = {};
+    desired.freq = APU::kOutputHz;
+    desired.format = AUDIO_S16SYS;
+    desired.channels = 2;
+    desired.samples = 1024;
+    desired.callback = SDLAudioCallback;
+    desired.userdata = snes.getAPU();
+    SDL_AudioDeviceID audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, NULL, 0);
+    if (audio_device != 0) {
+        SDL_PauseAudioDevice(audio_device, 0);
+    } else {
+        std::cerr << "[AUDIO] SDL audio init failed: " << SDL_GetError() << "\n";
+    }
     
     bool running = true;
     SDL_Event event;
     uint32_t frame_count = 0;
     uint32_t last_fps_time = SDL_GetTicks();
+    uint64_t perf_freq = SDL_GetPerformanceFrequency();
+    const uint64_t target_frame_ticks = perf_freq / 60;
 
     while (running) {
+        uint64_t frame_start = SDL_GetPerformanceCounter();
+
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) running = false;
             if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)
@@ -220,6 +259,15 @@ int main(int argc, char* argv[]) {
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
+
+        uint64_t frame_end = SDL_GetPerformanceCounter();
+        uint64_t elapsed_ticks = frame_end - frame_start;
+        if (elapsed_ticks < target_frame_ticks) {
+            uint32_t delay_ms = (uint32_t)(((target_frame_ticks - elapsed_ticks) * 1000) / perf_freq);
+            if (delay_ms > 0) {
+                SDL_Delay(delay_ms);
+            }
+        }
 
         frame_count++;
         uint32_t now = SDL_GetTicks();
@@ -247,6 +295,9 @@ int main(int argc, char* argv[]) {
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    if (audio_device != 0) {
+        SDL_CloseAudioDevice(audio_device);
+    }
     SDL_Quit();
 
     if (dump_state) {

@@ -13,7 +13,7 @@ PPU::PPU() {
     cgram_address = 0; cgram_latch = false; cgram_buffer = 0;
     oam_address = 0; oam_write_address = 0; oam_latch = false; oam_buffer = 0;
     bgmode = 0; obsel = 0;
-    inidisp = 0x80;  // Forced blank on boot
+    inidisp = 0x80;
     m7a = m7b = m7c = m7d = 0; mpy_result = 0;
     ophct = opvct = 0; ophct_latch = opvct_latch = false;
 
@@ -26,47 +26,70 @@ PPU::PPU() {
     framebuffer.fill(0);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  VRAM Address Translation — bits 2-3 of VMAIN ($2115) control this.
+//
+//  Games use these modes during DMA to arrange tile data efficiently.
+//  Without this, tile bytes end up at wrong addresses → garbled graphics.
+//
+//  Mode 0 (%00): No translation — address used as-is
+//  Mode 1 (%01): 8-bit rotate  — aaaaaaaaBBBccccc → aaaaaaaacccccBBB
+//  Mode 2 (%10): 9-bit rotate  — aaaaaaaBBBcccccc → aaaaaaaccccccBBB
+//  Mode 3 (%11): 10-bit rotate — aaaaaaBBBccccccc → aaaaaacccccccBBB
+// ═══════════════════════════════════════════════════════════════════════════
+uint16_t PPU::translateVRAMAddress(uint16_t addr) {
+    switch ((vmain >> 2) & 0x03) {
+    case 0: return addr;
+    case 1: return (addr & 0xFF00) | ((addr & 0x001F) << 3) | ((addr >> 5) & 0x07);
+    case 2: return (addr & 0xFE00) | ((addr & 0x003F) << 3) | ((addr >> 6) & 0x07);
+    case 3: return (addr & 0xFC00) | ((addr & 0x007F) << 3) | ((addr >> 7) & 0x07);
+    }
+    return addr;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  Register Read — games check many of these during boot
+//  Register Read
 // ─────────────────────────────────────────────────────────────────────────────
 uint8_t PPU::readRegister(uint16_t address) {
     switch (address) {
-    case 0x2134: return mpy_result & 0xFF;          // MPYL
-    case 0x2135: return (mpy_result >> 8) & 0xFF;   // MPYM
-    case 0x2136: return (mpy_result >> 16) & 0xFF;  // MPYH
+    case 0x2134: return mpy_result & 0xFF;
+    case 0x2135: return (mpy_result >> 8) & 0xFF;
+    case 0x2136: return (mpy_result >> 16) & 0xFF;
 
-    case 0x2137: // SLHV - latch H/V counter
+    case 0x2137:
         ophct_latch = false; opvct_latch = false;
         return 0x00;
 
-    case 0x2138: { // OAM data read
+    case 0x2138: {
         uint8_t val = (oam_write_address < oam.size()) ? oam[oam_write_address] : 0;
         oam_write_address++;
         return val;
     }
 
-    case 0x2139: { // VRAM data read low (prefetched)
+    case 0x2139: {
         uint8_t val = vram_prefetch & 0xFF;
         if ((vmain & 0x80) == 0) {
-            if (vram_address * 2 + 1 < (int)vram.size())
-                vram_prefetch = vram[vram_address*2] | (vram[vram_address*2+1] << 8);
+            uint16_t ta = translateVRAMAddress(vram_address);
+            if (ta * 2 + 1 < (int)vram.size())
+                vram_prefetch = vram[ta*2] | (vram[ta*2+1] << 8);
             uint8_t inc = vmain & 0x03;
             vram_address += (inc == 0) ? 1 : (inc == 1) ? 32 : 128;
         }
         return val;
     }
-    case 0x213A: { // VRAM data read high (prefetched)
+    case 0x213A: {
         uint8_t val = (vram_prefetch >> 8) & 0xFF;
         if ((vmain & 0x80) != 0) {
-            if (vram_address * 2 + 1 < (int)vram.size())
-                vram_prefetch = vram[vram_address*2] | (vram[vram_address*2+1] << 8);
+            uint16_t ta = translateVRAMAddress(vram_address);
+            if (ta * 2 + 1 < (int)vram.size())
+                vram_prefetch = vram[ta*2] | (vram[ta*2+1] << 8);
             uint8_t inc = vmain & 0x03;
             vram_address += (inc == 0) ? 1 : (inc == 1) ? 32 : 128;
         }
         return val;
     }
 
-    case 0x213B: { // CGRAM data read
+    case 0x213B: {
         uint8_t val;
         if (!cgram_latch) {
             uint16_t idx = (uint16_t)cgram_address * 2;
@@ -81,23 +104,19 @@ uint8_t PPU::readRegister(uint16_t address) {
         return val;
     }
 
-    case 0x213C: // OPHCT - horizontal counter
+    case 0x213C:
         if (!ophct_latch) { ophct_latch = true; return ophct & 0xFF; }
         else { ophct_latch = false; return (ophct >> 8) & 0x01; }
-
-    case 0x213D: // OPVCT - vertical counter
+    case 0x213D:
         if (!opvct_latch) { opvct_latch = true; return opvct & 0xFF; }
         else { opvct_latch = false; return (opvct >> 8) & 0x01; }
 
-    case 0x213E: // STAT77 - PPU1 status
-        return 0x01;  // PPU1 version 1, no range/time over
-
-    case 0x213F: // STAT78 - PPU2 status
+    case 0x213E: return 0x01;
+    case 0x213F:
         ophct_latch = false; opvct_latch = false;
-        return 0x03;  // PPU2 version 3, NTSC, no interlace
+        return 0x03;
 
-    default:
-        return 0x00;
+    default: return 0x00;
     }
 }
 
@@ -111,14 +130,12 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
 
     case 0x2102:
         oam_address = (oam_address & 0x0200) | ((uint16_t)data << 1);
-        oam_write_address = oam_address; oam_latch = false;
-        break;
+        oam_write_address = oam_address; oam_latch = false; break;
     case 0x2103:
         oam_address = (oam_address & 0x01FE) | ((data & 0x01) << 9);
-        oam_write_address = oam_address; oam_latch = false;
-        break;
+        oam_write_address = oam_address; oam_latch = false; break;
 
-    case 0x2104: // OAM data write
+    case 0x2104:
         if (oam_write_address >= 0x200) {
             if (oam_write_address < (int)oam.size()) oam[oam_write_address] = data;
             oam_write_address++;
@@ -150,19 +167,30 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
 
     case 0x2115: vmain = data; break;
 
-    case 0x2116:
+    // ══════════════════════════════════════════════════════════════════════
+    //  VRAM address set — apply translation for prefetch
+    // ══════════════════════════════════════════════════════════════════════
+    case 0x2116: {
         vram_address = (vram_address & 0xFF00) | data;
-        if (vram_address * 2 + 1 < (int)vram.size())
-            vram_prefetch = vram[vram_address*2] | (vram[vram_address*2+1] << 8);
+        uint16_t ta = translateVRAMAddress(vram_address);
+        if (ta * 2 + 1 < (int)vram.size())
+            vram_prefetch = vram[ta*2] | (vram[ta*2+1] << 8);
         break;
-    case 0x2117:
+    }
+    case 0x2117: {
         vram_address = (vram_address & 0x00FF) | ((uint16_t)data << 8);
-        if (vram_address * 2 + 1 < (int)vram.size())
-            vram_prefetch = vram[vram_address*2] | (vram[vram_address*2+1] << 8);
+        uint16_t ta = translateVRAMAddress(vram_address);
+        if (ta * 2 + 1 < (int)vram.size())
+            vram_prefetch = vram[ta*2] | (vram[ta*2+1] << 8);
         break;
+    }
 
+    // ══════════════════════════════════════════════════════════════════════
+    //  VRAM data write — apply address translation!
+    // ══════════════════════════════════════════════════════════════════════
     case 0x2118: {
-        uint32_t ba = (uint32_t)vram_address * 2;
+        uint16_t ta = translateVRAMAddress(vram_address);
+        uint32_t ba = (uint32_t)ta * 2;
         if (ba < vram.size()) vram[ba] = data;
         if ((vmain & 0x80) == 0) {
             uint8_t inc = vmain & 0x03;
@@ -171,7 +199,8 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
         break;
     }
     case 0x2119: {
-        uint32_t ba = (uint32_t)vram_address * 2 + 1;
+        uint16_t ta = translateVRAMAddress(vram_address);
+        uint32_t ba = (uint32_t)ta * 2 + 1;
         if (ba < vram.size()) vram[ba] = data;
         if ((vmain & 0x80) != 0) {
             uint8_t inc = vmain & 0x03;
@@ -180,13 +209,12 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
         break;
     }
 
-    // Mode 7 matrix registers
-    case 0x211B: m7a = (data << 8) | (bg_scroll_latch); bg_scroll_latch = data;
+    case 0x211B: m7a = (data << 8) | bg_scroll_latch; bg_scroll_latch = data;
         mpy_result = (int16_t)m7a * (int8_t)(m7b >> 8); break;
-    case 0x211C: m7b = (data << 8) | (bg_scroll_latch); bg_scroll_latch = data;
+    case 0x211C: m7b = (data << 8) | bg_scroll_latch; bg_scroll_latch = data;
         mpy_result = (int16_t)m7a * (int8_t)(m7b >> 8); break;
-    case 0x211D: m7c = (data << 8) | (bg_scroll_latch); bg_scroll_latch = data; break;
-    case 0x211E: m7d = (data << 8) | (bg_scroll_latch); bg_scroll_latch = data; break;
+    case 0x211D: m7c = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
+    case 0x211E: m7d = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
 
     case 0x2121: cgram_address = data; cgram_latch = false; break;
     case 0x2122:
@@ -216,11 +244,13 @@ uint32_t PPU::colorFromCGRAM(uint16_t cg_idx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Background Rendering (with scrolling and tilemap mirroring)
+//  Background Rendering
 // ─────────────────────────────────────────────────────────────────────────────
 void PPU::renderBG(int bg_num, int bpp) {
     uint32_t map_base = ((bg_sc[bg_num] >> 2) & 0x3F) * 0x400;
     uint8_t sc_size = bg_sc[bg_num] & 0x03;
+    bool large_tiles = ((bgmode >> (4 + bg_num)) & 0x01) != 0;
+    int cell_size = large_tiles ? 16 : 8;
     int map_w = (sc_size & 0x01) ? 64 : 32;
     int map_h = (sc_size & 0x02) ? 64 : 32;
 
@@ -230,20 +260,20 @@ void PPU::renderBG(int bg_num, int bpp) {
     else if (bg_num == 2) tile_base = (uint32_t)(bg_nba[1] & 0x0F) * 0x1000;
     else                  tile_base = (uint32_t)((bg_nba[1] >> 4) & 0x0F) * 0x1000;
 
-    const int wpt = (bpp == 2) ? 8 : 16;
-    const int pe  = (bpp == 2) ? 4 : 16;
+    const int wpt = (bpp == 2) ? 8 : (bpp == 4) ? 16 : 32;
+    const int pe  = (bpp == 2) ? 4 : (bpp == 4) ? 16 : 256;
     int pal_base = 0;
     if (bpp == 2 && (bgmode & 0x07) == 0) pal_base = bg_num * 32;
 
     uint16_t sx = bg_hofs[bg_num], sy = bg_vofs[bg_num];
 
     for (int scr_y = 0; scr_y < 224; scr_y++) {
-        int y = (scr_y + sy) & ((map_h * 8) - 1);
-        int ty = y / 8, fy = y % 8;
+        int y = (scr_y + sy) & ((map_h * cell_size) - 1);
+        int ty = y / cell_size, fy = y % cell_size;
 
         for (int scr_x = 0; scr_x < 256; scr_x++) {
-            int x = (scr_x + sx) & ((map_w * 8) - 1);
-            int tx = x / 8, fx = x % 8;
+            int x = (scr_x + sx) & ((map_w * cell_size) - 1);
+            int tx = x / cell_size, fx = x % cell_size;
 
             uint32_t sb = 0;
             int ltx = tx, lty = ty;
@@ -258,25 +288,39 @@ void PPU::renderBG(int bg_num, int bpp) {
             uint8_t  pal = (entry >> 10) & 0x07;
             bool hf = (entry & 0x4000), vf = (entry & 0x8000);
 
-            int row = vf ? (7 - fy) : fy;
-            int bit = hf ? fx : (7 - fx);
+            int local_x = hf ? (cell_size - 1 - fx) : fx;
+            int local_y = vf ? (cell_size - 1 - fy) : fy;
+            int subtile_x = local_x >> 3;
+            int subtile_y = local_y >> 3;
+            int row = local_y & 0x07;
+            int bit = 7 - (local_x & 0x07);
+
+            if (large_tiles)
+                tnum = (tnum + subtile_x + subtile_y * 16) & 0x03FF;
 
             uint32_t tw = tile_base + (uint32_t)tnum * wpt;
             uint32_t bp01 = tw + row;
             if (bp01 * 2 + 1 >= vram.size()) continue;
 
             uint8_t b0 = vram[bp01*2], b1 = vram[bp01*2+1];
-            uint8_t b2 = 0, b3 = 0;
-            if (bpp == 4) {
+            uint8_t b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, b7 = 0;
+            if (bpp >= 4) {
                 uint32_t bp23 = tw + 8 + row;
                 if (bp23 * 2 + 1 < vram.size()) { b2 = vram[bp23*2]; b3 = vram[bp23*2+1]; }
             }
+            if (bpp == 8) {
+                uint32_t bp45 = tw + 16 + row, bp67 = tw + 24 + row;
+                if (bp45 * 2 + 1 < vram.size()) { b4 = vram[bp45*2]; b5 = vram[bp45*2+1]; }
+                if (bp67 * 2 + 1 < vram.size()) { b6 = vram[bp67*2]; b7 = vram[bp67*2+1]; }
+            }
 
             uint8_t ci = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-            if (bpp == 4) ci |= (((b2 >> bit) & 1) << 2) | (((b3 >> bit) & 1) << 3);
+            if (bpp >= 4) ci |= (((b2 >> bit) & 1) << 2) | (((b3 >> bit) & 1) << 3);
+            if (bpp == 8) ci |= (((b4 >> bit) & 1) << 4) | (((b5 >> bit) & 1) << 5)
+                              | (((b6 >> bit) & 1) << 6) | (((b7 >> bit) & 1) << 7);
             if (ci == 0) continue;
 
-            uint16_t cg = (uint16_t)pal * pe + ci + pal_base;
+            uint16_t cg = (bpp == 8) ? ci : (uint16_t)pal * pe + ci + pal_base;
             framebuffer[scr_y * 256 + scr_x] = colorFromCGRAM(cg);
         }
     }
@@ -333,16 +377,9 @@ void PPU::renderSprites() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Frame Render
-// ─────────────────────────────────────────────────────────────────────────────
 void PPU::renderFrame() {
     vblank_flag = false;
-
-    if (inidisp & 0x80) {
-        framebuffer.fill(0xFF000000u);
-        vblank_flag = true;
-        return;
-    }
+    if (inidisp & 0x80) { framebuffer.fill(0xFF000000u); vblank_flag = true; return; }
 
     uint8_t brightness = inidisp & 0x0F;
     framebuffer.fill(colorFromCGRAM(0));
@@ -360,12 +397,20 @@ void PPU::renderFrame() {
         if (tm_main & 0x02) renderBG(1, 4);
         if (tm_main & 0x01) renderBG(0, 4);
         break;
-    case 2: case 4: case 6:
+    case 2: case 6:
         if (tm_main & 0x02) renderBG(1, 4);
         if (tm_main & 0x01) renderBG(0, 4);
         break;
-    case 3: case 5:
+    case 3:
         if (tm_main & 0x02) renderBG(1, 4);
+        if (tm_main & 0x01) renderBG(0, 8);
+        break;
+    case 4:
+        if (tm_main & 0x02) renderBG(1, 2);
+        if (tm_main & 0x01) renderBG(0, 8);
+        break;
+    case 5:
+        if (tm_main & 0x02) renderBG(1, 2);
         if (tm_main & 0x01) renderBG(0, 4);
         break;
     default: break;
@@ -376,36 +421,25 @@ void PPU::renderFrame() {
     if (brightness < 15) {
         for (auto& pixel : framebuffer) {
             uint8_t r = (pixel >> 16) & 0xFF, g = (pixel >> 8) & 0xFF, b = pixel & 0xFF;
-            r = (uint8_t)((r * brightness) / 15);
-            g = (uint8_t)((g * brightness) / 15);
-            b = (uint8_t)((b * brightness) / 15);
-            pixel = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            pixel = 0xFF000000u | (((uint32_t)r*brightness/15) << 16)
+                  | (((uint32_t)g*brightness/15) << 8) | ((uint32_t)b*brightness/15);
         }
     }
-
     vblank_flag = true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Debug counters
+// ─────────────────────────────────────────────────────────────────────────────
 size_t PPU::countNonZeroVRAM() const {
-    return (size_t)std::count_if(vram.begin(), vram.end(), [](uint8_t value) {
-        return value != 0;
-    });
+    return (size_t)std::count_if(vram.begin(), vram.end(), [](uint8_t v) { return v != 0; });
 }
-
 size_t PPU::countNonZeroCGRAM() const {
-    return (size_t)std::count_if(cgram.begin(), cgram.end(), [](uint8_t value) {
-        return value != 0;
-    });
+    return (size_t)std::count_if(cgram.begin(), cgram.end(), [](uint8_t v) { return v != 0; });
 }
-
 size_t PPU::countNonZeroOAM() const {
-    return (size_t)std::count_if(oam.begin(), oam.end(), [](uint8_t value) {
-        return value != 0;
-    });
+    return (size_t)std::count_if(oam.begin(), oam.end(), [](uint8_t v) { return v != 0; });
 }
-
 size_t PPU::countNonBlackPixels() const {
-    return (size_t)std::count_if(framebuffer.begin(), framebuffer.end(), [](uint32_t pixel) {
-        return (pixel & 0x00FFFFFFu) != 0;
-    });
+    return (size_t)std::count_if(framebuffer.begin(), framebuffer.end(), [](uint32_t p) { return (p & 0x00FFFFFFu) != 0; });
 }
