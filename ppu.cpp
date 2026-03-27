@@ -44,6 +44,9 @@ PPU::PPU() {
     tm_main = 0; tm_sub = 0;
     tmw_main = 0; tsw_sub = 0;
     cgwsel = 0; cgadsub = 0; fixed_color = 0;
+    w12sel = 0; w34sel = 0; wobjsel = 0;
+    wbglog = 0; wobjlog = 0;
+    wh0 = 0; wh1 = 0; wh2 = 0; wh3 = 0;
     framebuffer.fill(0);
 }
 
@@ -259,6 +262,15 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
         }
         break;
 
+    case 0x2123: w12sel = data; break;
+    case 0x2124: w34sel = data; break;
+    case 0x2125: wobjsel = data; break;
+    case 0x2126: wh0 = data; break;
+    case 0x2127: wh1 = data; break;
+    case 0x2128: wh2 = data; break;
+    case 0x2129: wh3 = data; break;
+    case 0x212A: wbglog = data; break;
+    case 0x212B: wobjlog = data; break;
     case 0x212C: tm_main = data; break;
     case 0x212D: tm_sub = data; break;
     case 0x212E: tmw_main = data; break;
@@ -287,12 +299,86 @@ uint32_t PPU::colorFromCGRAM(uint16_t cg_idx) {
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
 }
 
+bool PPU::evaluateWindowMask(uint8_t select, uint8_t logic, int x) const {
+    auto evalWindow = [x](bool enabled, bool invert, uint8_t left, uint8_t right) {
+        if (!enabled) return false;
+        const bool active = left <= right && x >= left && x <= right;
+        return invert ? !active : active;
+    };
+
+    const bool win1_enabled = (select & 0x02) != 0;
+    const bool win1_invert = (select & 0x01) != 0;
+    const bool win2_enabled = (select & 0x08) != 0;
+    const bool win2_invert = (select & 0x04) != 0;
+    const bool win1 = evalWindow(win1_enabled, win1_invert, wh0, wh1);
+    const bool win2 = evalWindow(win2_enabled, win2_invert, wh2, wh3);
+
+    if (win1_enabled && win2_enabled) {
+        switch (logic & 0x03) {
+        case 0: return win1 || win2;
+        case 1: return win1 && win2;
+        case 2: return win1 != win2;
+        case 3: return win1 == win2;
+        }
+    }
+    if (win1_enabled) return win1;
+    if (win2_enabled) return win2;
+    return false;
+}
+
+bool PPU::layerWindowMasked(int layer_index, bool main_screen, int x) const {
+    const uint8_t enable_mask = main_screen ? tmw_main : tsw_sub;
+    const uint8_t layer_bit = (layer_index >= 0 && layer_index < 4) ? (uint8_t)(1u << layer_index) : 0x10;
+    if ((enable_mask & layer_bit) == 0) return false;
+
+    uint8_t select = 0;
+    uint8_t logic = 0;
+    switch (layer_index) {
+    case 0:
+        select = w12sel & 0x0F;
+        logic = wbglog & 0x03;
+        break;
+    case 1:
+        select = (w12sel >> 4) & 0x0F;
+        logic = (wbglog >> 2) & 0x03;
+        break;
+    case 2:
+        select = w34sel & 0x0F;
+        logic = (wbglog >> 4) & 0x03;
+        break;
+    case 3:
+        select = (w34sel >> 4) & 0x0F;
+        logic = (wbglog >> 6) & 0x03;
+        break;
+    default:
+        select = wobjsel & 0x0F;
+        logic = wobjlog & 0x03;
+        break;
+    }
+
+    return evaluateWindowMask(select, logic, x);
+}
+
+bool PPU::colorWindowActive(int x) const {
+    return evaluateWindowMask((wobjsel >> 4) & 0x0F, (wobjlog >> 2) & 0x03, x);
+}
+
+bool PPU::colorWindowRegionEnabled(uint8_t region_mode, bool window_active) const {
+    switch (region_mode & 0x03) {
+    case 0: return false;
+    case 1: return window_active;
+    case 2: return !window_active;
+    case 3: return true;
+    }
+    return false;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Background Rendering
 // ─────────────────────────────────────────────────────────────────────────────
-void PPU::renderBG(int bg_num, int bpp, bool high_priority, uint32_t* target, uint8_t* source) {
-    // BGxSC stores the tilemap base as a word address in 0x200-word units.
-    uint32_t map_base = ((bg_sc[bg_num] >> 2) & 0x3F) * 0x200;
+void PPU::renderBG(int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source) {
+    // BGxSC stores the tilemap base as a word address in 0x400-word units.
+    uint32_t map_base = ((bg_sc[bg_num] >> 2) & 0x3F) * 0x400;
     uint8_t sc_size = bg_sc[bg_num] & 0x03;
     bool large_tiles = ((bgmode >> (4 + bg_num)) & 0x01) != 0;
     int cell_size = large_tiles ? 16 : 8;
@@ -320,6 +406,8 @@ void PPU::renderBG(int bg_num, int bpp, bool high_priority, uint32_t* target, ui
         int ty = y / cell_size, fy = y % cell_size;
 
         for (int scr_x = 0; scr_x < 256; scr_x++) {
+            if (layerWindowMasked(bg_num, main_screen, scr_x)) continue;
+
             int x = (scr_x + sx) & ((map_w * cell_size) - 1);
             int tx = x / cell_size, fx = x % cell_size;
 
@@ -383,7 +471,7 @@ void PPU::renderBG(int bg_num, int bpp, bool high_priority, uint32_t* target, ui
 // ─────────────────────────────────────────────────────────────────────────────
 //  Sprite Rendering
 // ─────────────────────────────────────────────────────────────────────────────
-void PPU::renderSprites(int priority, uint32_t* target, uint8_t* source) {
+void PPU::renderSprites(int priority, bool main_screen, uint32_t* target, uint8_t* source) {
     static const int obj_sizes[8][2][2] = {
         {{8,8},{16,16}}, {{8,8},{32,32}}, {{8,8},{64,64}}, {{16,16},{32,32}},
         {{16,16},{64,64}}, {{32,32},{64,64}}, {{16,32},{32,64}}, {{16,32},{32,32}},
@@ -395,7 +483,7 @@ void PPU::renderSprites(int priority, uint32_t* target, uint8_t* source) {
     for (int s = 127; s >= 0; s--) {
         int base = s * 4;
         int16_t ox = oam[base]; uint8_t oy = oam[base+1];
-        uint16_t tile = oam[base+2]; uint8_t attr = oam[base+3];
+        uint8_t tile = oam[base+2]; uint8_t attr = oam[base+3];
         int hb = 0x200 + (s >> 2); int hs = (s & 3) * 2;
         uint8_t hi = (oam[hb] >> hs) & 0x03;
         if (hi & 0x01) ox = (int16_t)(ox | 0xFF00);
@@ -413,11 +501,12 @@ void PPU::renderSprites(int priority, uint32_t* target, uint8_t* source) {
             for (int px = 0; px < ow; px++) {
                 int scr_x = ox + px;
                 if (scr_x < 0 || scr_x >= 256) continue;
+                if (layerWindowMasked(4, main_screen, scr_x)) continue;
                 int col = hf ? (ow-1-px) : px;
-                uint16_t t = tile;
+                uint16_t t = (uint16_t)tile | (uint16_t)((attr & 0x01) << 8);
+                t = (uint16_t)((t + (row / 8) * 16 + (col / 8)) & 0x01FF);
                 uint32_t ba = name_base;
                 if (t & 0x100) { ba += name_gap; t &= 0xFF; }
-                t += (row/8)*16 + (col/8); t &= 0xFF;
                 uint32_t tw = wrapVRAMWordAddress(ba + (uint32_t)t * 16);
                 int fr = row % 8, fc = col % 8;
                 uint32_t bp01 = wrapVRAMWordAddress(tw + fr);
@@ -451,89 +540,112 @@ void PPU::renderFrame() {
     main_src.fill(0);
     sub_src.fill(0);
 
-    auto renderScreen = [this](uint8_t layer_mask, uint32_t* target, uint8_t* source) {
+    auto renderScreen = [this](uint8_t layer_mask, bool main_screen, uint32_t* target, uint8_t* source) {
         auto drawOBJ = [&](int prio) {
-            if (layer_mask & 0x10) renderSprites(prio, target, source);
+            if (layer_mask & 0x10) renderSprites(prio, main_screen, target, source);
+        };
+        auto drawBG = [&](int bg_num, int bpp, bool high_priority) {
+            if (layer_mask & (1u << bg_num)) {
+                renderBG(bg_num, bpp, high_priority, main_screen, target, source);
+            }
         };
 
         uint8_t mode = bgmode & 0x07;
         switch (mode) {
         case 0:
-            if (layer_mask & 0x08) renderBG(3, 2, false, target, source);
-            if (layer_mask & 0x04) renderBG(2, 2, false, target, source);
-            if (layer_mask & 0x02) renderBG(1, 2, false, target, source);
-            if (layer_mask & 0x01) renderBG(0, 2, false, target, source);
+            drawBG(3, 2, false);
+            drawBG(2, 2, false);
             drawOBJ(0);
-            if (layer_mask & 0x08) renderBG(3, 2, true, target, source);
-            if (layer_mask & 0x04) renderBG(2, 2, true, target, source);
-            if (layer_mask & 0x02) renderBG(1, 2, true, target, source);
-            if (layer_mask & 0x01) renderBG(0, 2, true, target, source);
-            drawOBJ(1); drawOBJ(2); drawOBJ(3);
+            drawBG(3, 2, true);
+            drawBG(2, 2, true);
+            drawOBJ(1);
+            drawBG(1, 2, false);
+            drawBG(0, 2, false);
+            drawOBJ(2);
+            drawBG(1, 2, true);
+            drawBG(0, 2, true);
+            drawOBJ(3);
             break;
         case 1:
             if (bgmode & 0x08) {
-                if (layer_mask & 0x04) renderBG(2, 2, false, target, source);
+                drawBG(2, 2, false);
                 drawOBJ(0);
-                if (layer_mask & 0x02) renderBG(1, 4, false, target, source);
-                if (layer_mask & 0x01) renderBG(0, 4, false, target, source);
                 drawOBJ(1);
-                if (layer_mask & 0x02) renderBG(1, 4, true, target, source);
-                if (layer_mask & 0x01) renderBG(0, 4, true, target, source);
+                drawBG(1, 4, false);
+                drawBG(0, 4, false);
                 drawOBJ(2);
-                if (layer_mask & 0x04) renderBG(2, 2, true, target, source);
+                drawBG(1, 4, true);
+                drawBG(0, 4, true);
                 drawOBJ(3);
+                drawBG(2, 2, true);
             } else {
-                if (layer_mask & 0x04) renderBG(2, 2, false, target, source);
+                drawBG(2, 2, false);
                 drawOBJ(0);
-                if (layer_mask & 0x04) renderBG(2, 2, true, target, source);
+                drawBG(2, 2, true);
                 drawOBJ(1);
-                if (layer_mask & 0x02) renderBG(1, 4, false, target, source);
-                if (layer_mask & 0x01) renderBG(0, 4, false, target, source);
+                drawBG(1, 4, false);
+                drawBG(0, 4, false);
                 drawOBJ(2);
-                if (layer_mask & 0x02) renderBG(1, 4, true, target, source);
-                if (layer_mask & 0x01) renderBG(0, 4, true, target, source);
+                drawBG(1, 4, true);
+                drawBG(0, 4, true);
                 drawOBJ(3);
             }
             break;
-        case 2: case 6:
-            if (layer_mask & 0x02) renderBG(1, 4, false, target, source);
-            if (layer_mask & 0x01) renderBG(0, 4, false, target, source);
+        case 2:
+            drawBG(1, 4, false);
             drawOBJ(0);
-            if (layer_mask & 0x02) renderBG(1, 4, true, target, source);
-            if (layer_mask & 0x01) renderBG(0, 4, true, target, source);
-            drawOBJ(1); drawOBJ(2); drawOBJ(3);
+            drawBG(0, 4, false);
+            drawOBJ(1);
+            drawBG(1, 4, true);
+            drawOBJ(2);
+            drawBG(0, 4, true);
+            drawOBJ(3);
             break;
         case 3:
-            if (layer_mask & 0x02) renderBG(1, 4, false, target, source);
-            if (layer_mask & 0x01) renderBG(0, 8, false, target, source);
+            drawBG(1, 4, false);
             drawOBJ(0);
-            if (layer_mask & 0x02) renderBG(1, 4, true, target, source);
-            if (layer_mask & 0x01) renderBG(0, 8, true, target, source);
-            drawOBJ(1); drawOBJ(2); drawOBJ(3);
+            drawBG(0, 8, false);
+            drawOBJ(1);
+            drawBG(1, 4, true);
+            drawOBJ(2);
+            drawBG(0, 8, true);
+            drawOBJ(3);
             break;
         case 4:
-            if (layer_mask & 0x02) renderBG(1, 2, false, target, source);
-            if (layer_mask & 0x01) renderBG(0, 8, false, target, source);
+            drawBG(1, 2, false);
             drawOBJ(0);
-            if (layer_mask & 0x02) renderBG(1, 2, true, target, source);
-            if (layer_mask & 0x01) renderBG(0, 8, true, target, source);
-            drawOBJ(1); drawOBJ(2); drawOBJ(3);
+            drawBG(0, 8, false);
+            drawOBJ(1);
+            drawBG(1, 2, true);
+            drawOBJ(2);
+            drawBG(0, 8, true);
+            drawOBJ(3);
             break;
         case 5:
-            if (layer_mask & 0x02) renderBG(1, 2, false, target, source);
-            if (layer_mask & 0x01) renderBG(0, 4, false, target, source);
+            drawBG(1, 2, false);
             drawOBJ(0);
-            if (layer_mask & 0x02) renderBG(1, 2, true, target, source);
-            if (layer_mask & 0x01) renderBG(0, 4, true, target, source);
-            drawOBJ(1); drawOBJ(2); drawOBJ(3);
+            drawBG(0, 4, false);
+            drawOBJ(1);
+            drawBG(1, 2, true);
+            drawOBJ(2);
+            drawBG(0, 4, true);
+            drawOBJ(3);
+            break;
+        case 6:
+            drawOBJ(0);
+            drawBG(0, 4, false);
+            drawOBJ(1);
+            drawOBJ(2);
+            drawBG(0, 4, true);
+            drawOBJ(3);
             break;
         default:
             break;
         }
     };
 
-    renderScreen(tm_main, main_fb.data(), main_src.data());
-    if (tm_sub) renderScreen(tm_sub, sub_fb.data(), sub_src.data());
+    renderScreen(tm_main, true, main_fb.data(), main_src.data());
+    if (tm_sub) renderScreen(tm_sub, false, sub_fb.data(), sub_src.data());
 
     auto fixed_color_argb = [this]() {
         uint16_t c15 = fixed_color & 0x7FFF;
@@ -546,6 +658,8 @@ void PPU::renderFrame() {
     const bool use_subscreen = (cgwsel & 0x02) != 0;
     const bool subtract = (cgadsub & 0x80) != 0;
     const bool half = (cgadsub & 0x40) != 0;
+    const uint8_t main_black_region = (cgwsel >> 6) & 0x03;
+    const uint8_t color_math_region = (cgwsel >> 4) & 0x03;
 
     auto colorMathEnabled = [this](uint8_t src) {
         switch (src) {
@@ -573,8 +687,18 @@ void PPU::renderFrame() {
     };
 
     for (size_t i = 0; i < kPixelCount; i++) {
+        const int x = (int)(i % 256);
+        const bool color_window = colorWindowActive(x);
         uint32_t pixel = main_fb[i];
-        if (colorMathEnabled(main_src[i])) {
+        if (colorWindowRegionEnabled(main_black_region, color_window)) {
+            pixel = 0xFF000000u;
+        }
+
+        bool allow_math = colorMathEnabled(main_src[i]);
+        if (colorWindowRegionEnabled(color_math_region, color_window)) {
+            allow_math = false;
+        }
+        if (allow_math) {
             pixel = combine(pixel, use_subscreen ? sub_fb[i] : fixed_argb);
         }
         framebuffer[i] = pixel;

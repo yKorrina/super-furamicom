@@ -9,6 +9,12 @@ constexpr int kCpuCyclesPerSecond = 29781 * 60;
 constexpr int kSpcCyclesPerSecond = 1024000;
 constexpr int kSpcCyclesPerSample = 32;
 constexpr std::size_t kMaxQueuedSamples = APU::kOutputHz * 2 * 2;
+constexpr std::array<int, 32> kCounterRates = {
+    0, 2048, 1536, 1280, 1024, 768, 640, 512,
+    384, 320, 256, 192, 160, 128, 96, 80,
+    64, 48, 40, 32, 24, 20, 16, 12,
+    10, 8, 6, 5, 4, 3, 2, 1,
+};
 
 constexpr std::array<uint8_t, 64> kIPLROM = {
     0xCD, 0xEF, 0xBD, 0xE8, 0x00, 0xC6, 0x1D, 0xD0,
@@ -24,10 +30,56 @@ constexpr std::array<uint8_t, 64> kIPLROM = {
 inline int clamp16(int value) {
     return std::clamp(value, -32768, 32767);
 }
+
+inline int clamp11(int value) {
+    return std::clamp(value, 0, 0x07FF);
+}
+
+inline int16_t signExtend15(uint16_t value) {
+    return (value & 0x4000) != 0 ? (int16_t)(value | 0x8000) : (int16_t)value;
+}
 }
 
 APU::APU() {
     reset();
+}
+
+std::array<APU::VoiceDebug, 8> APU::getVoiceDebug() const {
+    std::array<VoiceDebug, 8> info{};
+    for (int voice_index = 0; voice_index < 8; voice_index++) {
+        const Voice& voice = voices[voice_index];
+        const int base = voice_index << 4;
+        VoiceDebug& out = info[voice_index];
+        out.active = voice.active;
+        out.releasing = voice.releasing;
+        out.noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
+        out.pitch_mod_enabled = voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0;
+        out.source_number = voice.source_number;
+        out.source_start = voice.source_start;
+        out.loop_start = voice.loop_start;
+        out.next_block_addr = voice.next_block_addr;
+        out.pitch = (uint16_t)dsp_regs[base + 2] | ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8);
+        out.envelope = voice.envelope;
+        out.last_output = voice.last_output;
+        out.volume_left = (int8_t)dsp_regs[base + 0];
+        out.volume_right = (int8_t)dsp_regs[base + 1];
+        out.envx = dsp_regs[base + 8];
+        out.outx = dsp_regs[base + 9];
+    }
+    return info;
+}
+
+std::array<APU::TimerDebug, 3> APU::getTimerDebug() const {
+    std::array<TimerDebug, 3> info{};
+    for (int i = 0; i < 3; i++) {
+        info[i].target = timers[i].target;
+        info[i].stage2 = timers[i].stage2;
+        info[i].stage3 = timers[i].stage3;
+        info[i].divider = timers[i].divider;
+        info[i].enabled = timers[i].enabled;
+        info[i].period = timers[i].period;
+    }
+    return info;
 }
 
 void APU::reset() {
@@ -36,6 +88,7 @@ void APU::reset() {
     spc_to_cpu.fill(0);
     dsp_regs.fill(0);
     voices.fill(Voice{});
+    recent_audio_mono.fill(0);
     {
         std::lock_guard<std::mutex> lock(audio_mutex);
         audio_fifo.clear();
@@ -76,7 +129,11 @@ void APU::reset() {
     nonzero_audio_frames = 0;
     audio_peak_sample = 0;
     cpu_cycle_accumulator = 0;
+    dsp_sample_counter = 0;
     sample_cycle_accumulator = 0;
+    recent_audio_pos = 0;
+    recent_audio_filled = false;
+    noise_lfsr = 0x4000;
 
     dsp_regs[0x6C] = 0xE0;
     dsp_regs[0x7C] = 0x00;
@@ -204,6 +261,7 @@ void APU::writeDSP(uint8_t reg, uint8_t value) {
     case 0x6C:
         if (value & 0x80) {
             for (auto& voice : voices) {
+                voice.envelope_mode = EnvelopeMode::Release;
                 voice.releasing = true;
             }
         }
@@ -351,6 +409,126 @@ void APU::queueSample(int16_t left, int16_t right) {
     audio_fifo.push_back(right);
 }
 
+bool APU::shouldTickRate(uint8_t rate) const {
+    rate &= 0x1F;
+    if (rate == 0) return false;
+
+    const int period = kCounterRates[rate];
+    if (period <= 1) return true;
+    return (dsp_sample_counter % (std::uint64_t)period) == 0;
+}
+
+void APU::updateNoise() {
+    if (!shouldTickRate(dsp_regs[0x6C] & 0x1F)) return;
+
+    const uint16_t lfsr = (uint16_t)noise_lfsr & 0x7FFF;
+    const uint16_t feedback = ((lfsr >> 14) ^ (lfsr >> 13)) & 0x01;
+    uint16_t next = (uint16_t)(((lfsr << 1) & 0x7FFE) | feedback);
+    if (next == 0) next = 0x4000;
+    noise_lfsr = signExtend15(next);
+}
+
+void APU::updateEnvelope(int voice_index) {
+    Voice& voice = voices[voice_index];
+    const int base = voice_index << 4;
+    if (!voice.active) {
+        voice.envelope = 0;
+        return;
+    }
+
+    const uint8_t adsr1 = dsp_regs[base + 5];
+    const uint8_t adsr2 = dsp_regs[base + 6];
+    const uint8_t gain = dsp_regs[base + 7];
+
+    if (voice.releasing || (dsp_regs[0x6C] & 0x80) != 0) {
+        voice.envelope_mode = EnvelopeMode::Release;
+        voice.envelope = voice.envelope > 8 ? (uint16_t)(voice.envelope - 8) : 0;
+        if (voice.envelope == 0) {
+            voice.active = false;
+        }
+        return;
+    }
+
+    if ((adsr1 & 0x80) != 0) {
+        if (voice.envelope_mode == EnvelopeMode::Direct ||
+            voice.envelope_mode == EnvelopeMode::Gain ||
+            voice.envelope_mode == EnvelopeMode::Release) {
+            voice.envelope_mode = EnvelopeMode::Attack;
+        }
+
+        switch (voice.envelope_mode) {
+        case EnvelopeMode::Attack: {
+            const uint8_t rate = (uint8_t)(((adsr1 & 0x0F) << 1) + 1);
+            if (shouldTickRate(rate)) {
+                const int step = (adsr1 & 0x0F) == 0x0F ? 1024 : 32;
+                voice.envelope = (uint16_t)clamp11((int)voice.envelope + step);
+            }
+            if (voice.envelope >= 0x07FF) {
+                voice.envelope = 0x07FF;
+                voice.envelope_mode = EnvelopeMode::Decay;
+            }
+            break;
+        }
+        case EnvelopeMode::Decay: {
+            const uint8_t rate = (uint8_t)((((adsr1 >> 4) & 0x07) << 1) + 16);
+            if (shouldTickRate(rate)) {
+                int envelope = voice.envelope;
+                envelope -= 1;
+                envelope -= envelope >> 8;
+                voice.envelope = (uint16_t)clamp11(envelope);
+            }
+            const uint16_t sustain_level =
+                (uint16_t)std::min(0x07FF, (((adsr2 >> 5) & 0x07) + 1) << 8);
+            if (voice.envelope <= sustain_level) {
+                voice.envelope_mode = EnvelopeMode::Sustain;
+            }
+            break;
+        }
+        case EnvelopeMode::Sustain: {
+            const uint8_t rate = adsr2 & 0x1F;
+            if (shouldTickRate(rate)) {
+                int envelope = voice.envelope;
+                envelope -= 1;
+                envelope -= envelope >> 8;
+                voice.envelope = (uint16_t)clamp11(envelope);
+            }
+            break;
+        }
+        default:
+            voice.envelope_mode = EnvelopeMode::Attack;
+            break;
+        }
+        return;
+    }
+
+    if ((gain & 0x80) == 0) {
+        voice.envelope_mode = EnvelopeMode::Direct;
+        voice.envelope = (uint16_t)clamp11((gain & 0x7F) << 4);
+        return;
+    }
+
+    voice.envelope_mode = EnvelopeMode::Gain;
+    if (!shouldTickRate(gain & 0x1F)) return;
+
+    int envelope = voice.envelope;
+    switch ((gain >> 5) & 0x03) {
+    case 0:
+        envelope -= 32;
+        break;
+    case 1:
+        envelope -= 1;
+        envelope -= envelope >> 8;
+        break;
+    case 2:
+        envelope += 32;
+        break;
+    case 3:
+        envelope += envelope < 0x0600 ? 32 : 8;
+        break;
+    }
+    voice.envelope = (uint16_t)clamp11(envelope);
+}
+
 void APU::keyOn(uint8_t voice_mask) {
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
@@ -362,6 +540,7 @@ void APU::keyOn(uint8_t voice_mask) {
 void APU::keyOff(uint8_t voice_mask) {
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
+            voices[voice_index].envelope_mode = EnvelopeMode::Release;
             voices[voice_index].releasing = true;
         }
     }
@@ -382,19 +561,25 @@ void APU::resetVoice(int voice_index) {
         ((uint16_t)ram[(uint16_t)(entry_addr + 3)] << 8);
 
     voice.active = true;
-    voice.releasing = (dsp_regs[0x6C] & 0x80) != 0;
+    voice.releasing = false;
     voice.source_number = source_number;
     voice.source_start = source_start;
     voice.loop_start = loop_start;
     voice.next_block_addr = source_start;
     voice.interp_index = 0;
+    voice.sample_index = 0;
+    voice.envelope = 0;
+    voice.envelope_mode = EnvelopeMode::Attack;
 
     const uint8_t adsr1 = dsp_regs[base + 5];
     const uint8_t gain = dsp_regs[base + 7];
-    if ((adsr1 & 0x80) == 0 && (gain & 0x80) == 0) {
-        voice.envelope = (uint16_t)std::min(0x07FF, (int)gain << 4);
-    } else {
-        voice.envelope = voice.releasing ? 0u : 0x07FFu;
+    if ((adsr1 & 0x80) == 0) {
+        if ((gain & 0x80) == 0) {
+            voice.envelope_mode = EnvelopeMode::Direct;
+            voice.envelope = (uint16_t)clamp11((gain & 0x7F) << 4);
+        } else {
+            voice.envelope_mode = EnvelopeMode::Gain;
+        }
     }
 
     dsp_regs[0x7C] &= (uint8_t)~(1u << voice_index);
@@ -482,46 +667,49 @@ int16_t APU::renderVoice(int voice_index) {
         }
     }
 
-    const uint8_t adsr1 = dsp_regs[base + 5];
-    const uint8_t gain = dsp_regs[base + 7];
-    if (voice.releasing || (dsp_regs[0x6C] & 0x80) != 0) {
-        voice.envelope = voice.envelope > 32 ? (uint16_t)(voice.envelope - 32) : 0;
-        if (voice.envelope == 0) {
-            voice.active = false;
+    updateEnvelope(voice_index);
+    if (!voice.active || voice.envelope == 0) {
+        if (!voice.active) {
             dsp_regs[base + 8] = 0;
             dsp_regs[base + 9] = 0;
             return 0;
         }
-    } else if ((adsr1 & 0x80) == 0 && (gain & 0x80) == 0) {
-        voice.envelope = (uint16_t)std::min(0x07FF, (int)gain << 4);
-    } else if (voice.envelope == 0) {
-        voice.envelope = 0x07FF;
     }
 
-    const int sample = voice.decoded[voice.sample_index];
+    const bool noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
+    int sample = noise_enabled ? (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF)
+                               : (int)voice.decoded[voice.sample_index];
     const int voice_output = clamp16((sample * (int)voice.envelope) >> 11);
     voice.last_output = (int16_t)voice_output;
 
     dsp_regs[base + 8] = (uint8_t)std::min(0xFF, (int)(voice.envelope >> 4));
     dsp_regs[base + 9] = (uint8_t)(voice_output >> 8);
 
-    const uint16_t pitch =
-        (uint16_t)dsp_regs[base + 2] | ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8);
-    voice.interp_index = (uint16_t)(voice.interp_index + pitch);
-    while (voice.interp_index >= 0x1000 && voice.active) {
-        voice.interp_index -= 0x1000;
-        voice.sample_index++;
-        if (voice.sample_index >= 16) {
-            if (voice.stop_after_block) {
-                voice.releasing = true;
-                voice.sample_index = 15;
-                break;
-            }
-            if (!decodeNextBlock(voice_index)) {
-                voice.active = false;
-                dsp_regs[base + 8] = 0;
-                dsp_regs[base + 9] = 0;
-                return 0;
+    if (!noise_enabled) {
+        int pitch = (int)((uint16_t)dsp_regs[base + 2] |
+                          ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8));
+        if (voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0) {
+            const int8_t mod = (int8_t)dsp_regs[((voice_index - 1) << 4) + 9];
+            pitch += (pitch * mod) >> 7;
+        }
+        pitch = std::clamp(pitch, 0, 0x3FFF);
+
+        voice.interp_index = (uint16_t)(voice.interp_index + pitch);
+        while (voice.interp_index >= 0x1000 && voice.active) {
+            voice.interp_index -= 0x1000;
+            voice.sample_index++;
+            if (voice.sample_index >= 16) {
+                if (voice.stop_after_block) {
+                    voice.releasing = true;
+                    voice.sample_index = 15;
+                    break;
+                }
+                if (!decodeNextBlock(voice_index)) {
+                    voice.active = false;
+                    dsp_regs[base + 8] = 0;
+                    dsp_regs[base + 9] = 0;
+                    return 0;
+                }
             }
         }
     }
@@ -533,6 +721,8 @@ void APU::synthesizeSamples(int spc_cycles) {
     sample_cycle_accumulator += spc_cycles;
     while (sample_cycle_accumulator >= kSpcCyclesPerSample) {
         sample_cycle_accumulator -= kSpcCyclesPerSample;
+        dsp_sample_counter++;
+        updateNoise();
 
         int mixed_left = 0;
         int mixed_right = 0;

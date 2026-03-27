@@ -139,6 +139,7 @@ public:
 
     bool isCPUHalted() const { return cpu.isHalted(); }
     const uint32_t* getFramebuffer() const { return ppu.getFramebuffer(); }
+    const CPU& getCPU() const { return cpu; }
     const PPU& getPPU() const { return ppu; }
     APU* getAPU() { return &apu; }
 
@@ -160,6 +161,15 @@ public:
             << " BG34NBA=$" << (unsigned)ppu.getBGNBA(1)
             << " HOFS1=$" << ppu.getBGHOFS(0)
             << " VOFS1=$" << ppu.getBGVOFS(0)
+            << " W12SEL=$" << (unsigned)ppu.getW12SEL()
+            << " W34SEL=$" << (unsigned)ppu.getW34SEL()
+            << " WOBJSEL=$" << (unsigned)ppu.getWOBJSEL()
+            << " WBGLOG=$" << (unsigned)ppu.getWBGLOG()
+            << " WOBJLOG=$" << (unsigned)ppu.getWOBJLOG()
+            << " WH0=$" << (unsigned)ppu.getWH0()
+            << " WH1=$" << (unsigned)ppu.getWH1()
+            << " WH2=$" << (unsigned)ppu.getWH2()
+            << " WH3=$" << (unsigned)ppu.getWH3()
             << " CGWSEL=$" << (unsigned)ppu.getCGWSEL()
             << " CGADSUB=$" << (unsigned)ppu.getCGADSUB()
             << " FIXCOL=$" << ppu.getFixedColor()
@@ -227,7 +237,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Super Furamicom — SNES Emulator\n\n"
                   << "Usage: snes_emu <rom.sfc> [options]\n"
                   << "  --trace              CPU trace to trace.log\n"
-                  << "  --visualize          Open PPU debug window\n"
+                  << "  --visualize          Open CPU/PPU/APU debugger\n"
                   << "  --headless-frames N  Run N frames and exit\n"
                   << "  --dump-state         Print CPU/PPU state\n\n"
                   << "Controls:  Arrows=D-Pad  Z/X=Y/B  A/S=X/A  Q/W=L/R\n"
@@ -286,7 +296,7 @@ int main(int argc, char* argv[]) {
     if (do_visualize) {
         viz = new Visualizer();
         if (!viz->init()) { delete viz; viz = nullptr; }
-        else std::cout << "[VIZ] PPU Visualizer active (1=Tiles 2=Palette 3=BG Map)\n";
+        else std::cout << "[VIZ] Debugger active (1=CPU 2=PPU 3=APU)\n";
     }
 
     bool running = true;
@@ -348,7 +358,7 @@ int main(int argc, char* argv[]) {
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
 
-        if (viz && viz->isOpen()) viz->update(snes.getPPU());
+        if (viz && viz->isOpen()) viz->update(snes.getCPU(), snes.getPPU(), *snes.getAPU());
 
         // Frame timing
         uint64_t elapsed = SDL_GetPerformanceCounter() - frame_start;

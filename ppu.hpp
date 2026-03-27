@@ -29,6 +29,15 @@ public:
     uint8_t  getCGWSEL()       const { return cgwsel; }
     uint8_t  getCGADSUB()      const { return cgadsub; }
     uint16_t getFixedColor()   const { return fixed_color; }
+    uint8_t  getW12SEL()       const { return w12sel; }
+    uint8_t  getW34SEL()       const { return w34sel; }
+    uint8_t  getWOBJSEL()      const { return wobjsel; }
+    uint8_t  getWBGLOG()       const { return wbglog; }
+    uint8_t  getWOBJLOG()      const { return wobjlog; }
+    uint8_t  getWH0()          const { return wh0; }
+    uint8_t  getWH1()          const { return wh1; }
+    uint8_t  getWH2()          const { return wh2; }
+    uint8_t  getWH3()          const { return wh3; }
     uint16_t getVRAMAddress()  const { return vram_address; }
     uint8_t  getCGRAMAddress() const { return cgram_address; }
     uint16_t getOAMAddress()   const { return oam_address; }
@@ -83,6 +92,15 @@ private:
     uint8_t  cgwsel;
     uint8_t  cgadsub;
     uint16_t fixed_color;
+    uint8_t  w12sel;
+    uint8_t  w34sel;
+    uint8_t  wobjsel;
+    uint8_t  wbglog;
+    uint8_t  wobjlog;
+    uint8_t  wh0;
+    uint8_t  wh1;
+    uint8_t  wh2;
+    uint8_t  wh3;
 
     uint8_t  obsel;
     uint8_t  inidisp;
@@ -100,8 +118,12 @@ private:
     std::array<uint32_t, 256 * 224> framebuffer;
 
     uint16_t translateVRAMAddress(uint16_t addr);
-    void renderBG(int bg_num, int bpp, bool high_priority, uint32_t* target, uint8_t* source);
-    void renderSprites(int priority, uint32_t* target, uint8_t* source);
+    bool layerWindowMasked(int layer_index, bool main_screen, int x) const;
+    bool colorWindowActive(int x) const;
+    bool colorWindowRegionEnabled(uint8_t region_mode, bool window_active) const;
+    bool evaluateWindowMask(uint8_t select, uint8_t logic, int x) const;
+    void renderBG(int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source);
+    void renderSprites(int priority, bool main_screen, uint32_t* target, uint8_t* source);
     uint32_t colorFromCGRAM(uint16_t palette_offset);
 };
 

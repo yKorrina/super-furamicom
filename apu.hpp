@@ -10,6 +10,34 @@
 class APU {
 public:
     static constexpr int kOutputHz = 32000;
+    static constexpr std::size_t kDebugAudioHistory = 8192;
+
+    struct VoiceDebug {
+        bool active = false;
+        bool releasing = true;
+        bool noise_enabled = false;
+        bool pitch_mod_enabled = false;
+        uint8_t source_number = 0;
+        uint16_t source_start = 0;
+        uint16_t loop_start = 0;
+        uint16_t next_block_addr = 0;
+        uint16_t pitch = 0;
+        uint16_t envelope = 0;
+        int16_t last_output = 0;
+        int8_t volume_left = 0;
+        int8_t volume_right = 0;
+        uint8_t envx = 0;
+        uint8_t outx = 0;
+    };
+
+    struct TimerDebug {
+        uint8_t target = 0;
+        uint8_t stage2 = 0;
+        uint8_t stage3 = 0;
+        int divider = 0;
+        bool enabled = false;
+        int period = 0;
+    };
 
     APU();
 
@@ -41,11 +69,29 @@ public:
     std::uint64_t getGeneratedAudioFrames() const { return generated_audio_frames; }
     std::uint64_t getNonZeroAudioFrames() const { return nonzero_audio_frames; }
     int getAudioPeakSample() const { return audio_peak_sample; }
+    uint8_t getDSPAddress() const { return dsp_addr; }
+    uint8_t getControlReg() const { return control_reg; }
+    uint8_t getTestReg() const { return test_reg; }
     const std::array<uint8_t, 4>& getCpuToSPCPorts() const { return cpu_to_spc; }
     const std::array<uint8_t, 4>& getSPCToCpuPorts() const { return spc_to_cpu; }
     const uint8_t* getRAMData() const { return ram.data(); }
+    const std::array<int16_t, kDebugAudioHistory>& getRecentAudioMono() const { return recent_audio_mono; }
+    std::size_t getRecentAudioWritePos() const { return recent_audio_pos; }
+    bool hasRecentAudioHistory() const { return recent_audio_filled; }
+    int16_t getNoiseSample() const { return noise_lfsr; }
+    std::array<VoiceDebug, 8> getVoiceDebug() const;
+    std::array<TimerDebug, 3> getTimerDebug() const;
 
 private:
+    enum class EnvelopeMode : uint8_t {
+        Attack,
+        Decay,
+        Sustain,
+        Release,
+        Gain,
+        Direct,
+    };
+
     struct Voice {
         bool active = false;
         bool releasing = true;
@@ -57,6 +103,8 @@ private:
         uint16_t interp_index = 0;
         int sample_index = 0;
         uint16_t envelope = 0;
+        EnvelopeMode envelope_mode = EnvelopeMode::Release;
+        int envelope_latch = 0;
         int16_t prev1 = 0;
         int16_t prev2 = 0;
         int16_t last_output = 0;
@@ -87,6 +135,7 @@ private:
     std::array<uint8_t, 0x80> dsp_regs{};
     std::array<Timer, 3> timers{};
     std::array<Voice, 8> voices{};
+    std::array<int16_t, kDebugAudioHistory> recent_audio_mono{};
     std::deque<int16_t> audio_fifo;
     mutable std::mutex audio_mutex;
 
@@ -115,7 +164,11 @@ private:
     std::uint64_t nonzero_audio_frames = 0;
     int audio_peak_sample = 0;
     std::uint64_t cpu_cycle_accumulator = 0;
+    std::uint64_t dsp_sample_counter = 0;
     int sample_cycle_accumulator = 0;
+    std::size_t recent_audio_pos = 0;
+    bool recent_audio_filled = false;
+    int16_t noise_lfsr = 0x4000;
 
     uint8_t readMem(uint16_t address);
     void writeMem(uint16_t address, uint8_t data);
@@ -140,6 +193,9 @@ private:
     void keyOff(uint8_t voice_mask);
     void resetVoice(int voice_index);
     bool decodeNextBlock(int voice_index);
+    void updateEnvelope(int voice_index);
+    void updateNoise();
+    bool shouldTickRate(uint8_t rate) const;
     int16_t renderVoice(int voice_index);
     void runCycles(int spc_cycles);
     int stepInstruction();

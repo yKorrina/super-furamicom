@@ -2,6 +2,7 @@
 #define CPU_HPP
 
 #include <cstdint>
+#include <array>
 #include <fstream>
 #include <string>
 
@@ -9,6 +10,7 @@ class Bus;
 
 class CPU {
 public:
+    static constexpr std::size_t kDebugHistory = 1024;
     using AddrModeFunc = void (CPU::*)();
     using OpcodeFunc   = void (CPU::*)();
 
@@ -41,6 +43,13 @@ public:
     uint8_t getDB() const { return DB; }
     uint8_t getP() const { return P; }
     bool isEmulationMode() const { return E; }
+    uint8_t getLastOpcode() const { return last_opcode; }
+    const std::array<uint32_t, kDebugHistory>& getPCHistory() const { return pc_history; }
+    const std::array<uint16_t, kDebugHistory>& getAHistory() const { return a_history; }
+    const std::array<uint16_t, kDebugHistory>& getXHistory() const { return x_history; }
+    const std::array<uint16_t, kDebugHistory>& getYHistory() const { return y_history; }
+    std::size_t getHistoryPos() const { return history_pos; }
+    bool hasHistoryWrapped() const { return history_filled; }
 
 private:
     Bus* bus;
@@ -64,6 +73,13 @@ private:
     uint64_t instruction_count;
     uint64_t max_trace_lines;
     bool     trace_enabled;
+    uint8_t  last_opcode = 0;
+    std::array<uint32_t, kDebugHistory> pc_history{};
+    std::array<uint16_t, kDebugHistory> a_history{};
+    std::array<uint16_t, kDebugHistory> x_history{};
+    std::array<uint16_t, kDebugHistory> y_history{};
+    std::size_t history_pos = 0;
+    bool history_filled = false;
 
     void setFlag(uint8_t flag, bool value);
     bool getFlag(uint8_t flag);

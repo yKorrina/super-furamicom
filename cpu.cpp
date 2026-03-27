@@ -33,6 +33,13 @@ void CPU::reset() {
     SP = 0x01FF; P = 0x34; E = true;
     halted = false;
     waiting_for_interrupt = false;
+    last_opcode = 0;
+    history_pos = 0;
+    history_filled = false;
+    pc_history.fill(0);
+    a_history.fill(0);
+    x_history.fill(0);
+    y_history.fill(0);
     PC = read16(0x00FFFC);
     cycles_remaining = 8;
 
@@ -53,6 +60,13 @@ uint8_t CPU::step() {
 
     uint32_t pc_full = ((uint32_t)PB << 16) | PC;
     fetched_opcode = read8(pc_full);
+    last_opcode = fetched_opcode;
+    pc_history[history_pos] = pc_full;
+    a_history[history_pos] = A;
+    x_history[history_pos] = X;
+    y_history[history_pos] = Y;
+    history_pos = (history_pos + 1) % kDebugHistory;
+    history_filled = history_filled || history_pos == 0;
 
     // ── Trace log ────────────────────────────────────────────────────────────
     if (trace_enabled && instruction_count < max_trace_lines) {
