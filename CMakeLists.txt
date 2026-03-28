@@ -10,10 +10,8 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 
-# Find SDL2
 find_package(SDL2 REQUIRED)
 
-# Source files in src/ directory
 file(GLOB SOURCES "src/*.cpp")
 add_executable(snes_emu ${SOURCES})
 
