@@ -15,9 +15,13 @@ public:
     struct VoiceDebug {
         bool active = false;
         bool releasing = true;
+        bool key_on_pending = false;
         bool noise_enabled = false;
         bool pitch_mod_enabled = false;
         uint8_t source_number = 0;
+        uint8_t adsr1 = 0;
+        uint8_t adsr2 = 0;
+        uint8_t gain = 0;
         uint16_t source_start = 0;
         uint16_t loop_start = 0;
         uint16_t next_block_addr = 0;
@@ -72,6 +76,15 @@ public:
     uint8_t getDSPAddress() const { return dsp_addr; }
     uint8_t getControlReg() const { return control_reg; }
     uint8_t getTestReg() const { return test_reg; }
+    std::uint64_t getDSPWriteCount(uint8_t reg) const { return dsp_write_counts[reg & 0x7F]; }
+    std::uint64_t getKeyOnCount() const { return key_on_count; }
+    std::uint64_t getKeyOffCount() const { return key_off_count; }
+    uint8_t getLastKeyOnMask() const { return last_key_on_mask; }
+    uint8_t getLastKeyOffMask() const { return last_key_off_mask; }
+    const std::array<std::uint64_t, 4>& getCpuPortWriteCounts() const { return cpu_port_write_counts; }
+    const std::array<std::uint64_t, 4>& getSpcPortWriteCounts() const { return spc_port_write_counts; }
+    const std::array<uint8_t, 4>& getLastCpuPortWrites() const { return last_cpu_port_writes; }
+    const std::array<uint8_t, 4>& getLastSpcPortWrites() const { return last_spc_port_writes; }
     const std::array<uint8_t, 4>& getCpuToSPCPorts() const { return cpu_to_spc; }
     const std::array<uint8_t, 4>& getSPCToCpuPorts() const { return spc_to_cpu; }
     const uint8_t* getRAMData() const { return ram.data(); }
@@ -96,11 +109,13 @@ private:
         bool active = false;
         bool releasing = true;
         bool stop_after_block = false;
+        bool key_on_pending = false;
         uint8_t source_number = 0;
         uint16_t source_start = 0;
         uint16_t loop_start = 0;
         uint16_t next_block_addr = 0;
         uint16_t interp_index = 0;
+        int kon_delay = 0;
         int sample_index = 0;
         uint16_t envelope = 0;
         EnvelopeMode envelope_mode = EnvelopeMode::Release;
@@ -108,7 +123,7 @@ private:
         int16_t prev1 = 0;
         int16_t prev2 = 0;
         int16_t last_output = 0;
-        std::array<int16_t, 16> decoded{};
+        std::deque<int16_t> decoded_samples;
     };
 
     struct Timer {
@@ -133,9 +148,12 @@ private:
     std::array<uint8_t, 4> cpu_to_spc{};
     std::array<uint8_t, 4> spc_to_cpu{};
     std::array<uint8_t, 0x80> dsp_regs{};
+    std::array<std::uint64_t, 0x80> dsp_write_counts{};
     std::array<Timer, 3> timers{};
     std::array<Voice, 8> voices{};
     std::array<int16_t, kDebugAudioHistory> recent_audio_mono{};
+    std::array<int16_t, 8> echo_history_left{};
+    std::array<int16_t, 8> echo_history_right{};
     std::deque<int16_t> audio_fifo;
     mutable std::mutex audio_mutex;
 
@@ -166,9 +184,19 @@ private:
     std::uint64_t cpu_cycle_accumulator = 0;
     std::uint64_t dsp_sample_counter = 0;
     int sample_cycle_accumulator = 0;
+    int spc_cycle_budget = 0;
     std::size_t recent_audio_pos = 0;
     bool recent_audio_filled = false;
+    std::size_t echo_history_pos = 0;
     int16_t noise_lfsr = 0x4000;
+    std::uint64_t key_on_count = 0;
+    std::uint64_t key_off_count = 0;
+    uint8_t last_key_on_mask = 0;
+    uint8_t last_key_off_mask = 0;
+    std::array<std::uint64_t, 4> cpu_port_write_counts{};
+    std::array<std::uint64_t, 4> spc_port_write_counts{};
+    std::array<uint8_t, 4> last_cpu_port_writes{};
+    std::array<uint8_t, 4> last_spc_port_writes{};
 
     uint8_t readMem(uint16_t address);
     void writeMem(uint16_t address, uint8_t data);
@@ -197,6 +225,8 @@ private:
     void updateNoise();
     bool shouldTickRate(uint8_t rate) const;
     int16_t renderVoice(int voice_index);
+    int16_t readSample16(uint16_t address) const;
+    void writeSample16(uint16_t address, int16_t sample);
     void runCycles(int spc_cycles);
     int stepInstruction();
     void tickTimers(int spc_cycles);

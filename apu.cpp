@@ -1,6 +1,7 @@
 #include "apu.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -9,6 +10,7 @@ constexpr int kCpuCyclesPerSecond = 29781 * 60;
 constexpr int kSpcCyclesPerSecond = 1024000;
 constexpr int kSpcCyclesPerSample = 32;
 constexpr std::size_t kMaxQueuedSamples = APU::kOutputHz * 2 * 2;
+constexpr double kPi = 3.14159265358979323846;
 constexpr std::array<int, 32> kCounterRates = {
     0, 2048, 1536, 1280, 1024, 768, 640, 512,
     384, 320, 256, 192, 160, 128, 96, 80,
@@ -38,6 +40,43 @@ inline int clamp11(int value) {
 inline int16_t signExtend15(uint16_t value) {
     return (value & 0x4000) != 0 ? (int16_t)(value | 0x8000) : (int16_t)value;
 }
+
+inline int clampIndex(int value, int lo, int hi) {
+    return std::max(lo, std::min(value, hi));
+}
+
+std::array<int16_t, 512> BuildGaussianTable() {
+    std::array<int16_t, 512> table{};
+    std::array<double, 512> weights{};
+
+    for (int n = 0; n < 512; n++) {
+        const double k = 0.5 + (double)n;
+        const double s = std::sin(kPi * k * 1.280 / 1024.0);
+        const double t = (std::cos(kPi * k * 2.000 / 1023.0) - 1.0) * 0.50;
+        const double u = (std::cos(kPi * k * 4.000 / 1023.0) - 1.0) * 0.08;
+        weights[511 - n] = s * (t + u + 1.0) / k;
+    }
+
+    for (int phase = 0; phase < 128; phase++) {
+        const double sum = weights[phase + 0] +
+                           weights[phase + 256] +
+                           weights[511 - phase] +
+                           weights[255 - phase];
+        const double scale = 2048.0 / sum;
+
+        table[phase + 0] = (int16_t)(weights[phase + 0] * scale + 0.5);
+        table[phase + 256] = (int16_t)(weights[phase + 256] * scale + 0.5);
+        table[511 - phase] = (int16_t)(weights[511 - phase] * scale + 0.5);
+        table[255 - phase] = (int16_t)(weights[255 - phase] * scale + 0.5);
+    }
+
+    return table;
+}
+
+const std::array<int16_t, 512>& GaussianTable() {
+    static const std::array<int16_t, 512> table = BuildGaussianTable();
+    return table;
+}
 }
 
 APU::APU() {
@@ -52,9 +91,13 @@ std::array<APU::VoiceDebug, 8> APU::getVoiceDebug() const {
         VoiceDebug& out = info[voice_index];
         out.active = voice.active;
         out.releasing = voice.releasing;
+        out.key_on_pending = voice.key_on_pending;
         out.noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
         out.pitch_mod_enabled = voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0;
         out.source_number = voice.source_number;
+        out.adsr1 = dsp_regs[base + 5];
+        out.adsr2 = dsp_regs[base + 6];
+        out.gain = dsp_regs[base + 7];
         out.source_start = voice.source_start;
         out.loop_start = voice.loop_start;
         out.next_block_addr = voice.next_block_addr;
@@ -87,8 +130,11 @@ void APU::reset() {
     cpu_to_spc.fill(0);
     spc_to_cpu.fill(0);
     dsp_regs.fill(0);
+    dsp_write_counts.fill(0);
     voices.fill(Voice{});
     recent_audio_mono.fill(0);
+    echo_history_left.fill(0);
+    echo_history_right.fill(0);
     {
         std::lock_guard<std::mutex> lock(audio_mutex);
         audio_fifo.clear();
@@ -100,9 +146,6 @@ void APU::reset() {
     timers[0].period = 128;
     timers[1].period = 128;
     timers[2].period = 16;
-    timers[0].stage3 = 0x0F;
-    timers[1].stage3 = 0x0F;
-    timers[2].stage3 = 0x0F;
 
     pc = 0xFFC0;
     a = 0x00;
@@ -131,9 +174,19 @@ void APU::reset() {
     cpu_cycle_accumulator = 0;
     dsp_sample_counter = 0;
     sample_cycle_accumulator = 0;
+    spc_cycle_budget = 0;
     recent_audio_pos = 0;
     recent_audio_filled = false;
+    echo_history_pos = 0;
     noise_lfsr = 0x4000;
+    key_on_count = 0;
+    key_off_count = 0;
+    last_key_on_mask = 0;
+    last_key_off_mask = 0;
+    cpu_port_write_counts.fill(0);
+    spc_port_write_counts.fill(0);
+    last_cpu_port_writes.fill(0);
+    last_spc_port_writes.fill(0);
 
     dsp_regs[0x6C] = 0xE0;
     dsp_regs[0x7C] = 0x00;
@@ -147,7 +200,10 @@ uint8_t APU::readPort(uint8_t port) const {
 }
 
 void APU::writePort(uint8_t port, uint8_t data) {
-    cpu_to_spc[port & 0x03] = data;
+    const std::size_t index = port & 0x03;
+    cpu_to_spc[index] = data;
+    cpu_port_write_counts[index]++;
+    last_cpu_port_writes[index] = data;
 }
 
 void APU::tickCPUCycles(int cpu_cycles) {
@@ -210,8 +266,8 @@ uint8_t APU::readMem(uint16_t address) {
     }
 
     switch (address) {
-    case 0x00F0: return 0x00;
-    case 0x00F1: return 0x00;
+    case 0x00F0: return ram[address];
+    case 0x00F1: return ram[address];
     case 0x00F2: return dsp_addr;
     case 0x00F3: return dsp_regs[dsp_addr & 0x7F];
     case 0x00F4:
@@ -222,7 +278,7 @@ uint8_t APU::readMem(uint16_t address) {
     case 0x00FA:
     case 0x00FB:
     case 0x00FC:
-        return 0x00;
+        return ram[address];
     case 0x00FD:
     case 0x00FE:
     case 0x00FF: {
@@ -246,6 +302,7 @@ void APU::updateDriverReadyState() {
 
 void APU::writeDSP(uint8_t reg, uint8_t value) {
     reg &= 0x7F;
+    dsp_write_counts[reg]++;
     if (reg == 0x7C) {
         dsp_regs[reg] = 0x00;
         return;
@@ -282,18 +339,20 @@ void APU::writeMem(uint16_t address, uint8_t data) {
         control_reg = data;
         ipl_rom_enabled = (data & 0x80) != 0;
 
-        if (data & 0x20) {
+        if (data & 0x10) {
             cpu_to_spc[0] = 0x00;
             cpu_to_spc[1] = 0x00;
         }
-        if (data & 0x10) {
+        if (data & 0x20) {
             cpu_to_spc[2] = 0x00;
             cpu_to_spc[3] = 0x00;
         }
 
         for (int i = 0; i < 3; i++) {
+            const bool was_enabled = timers[i].enabled;
             const bool new_enabled = (data & (1 << i)) != 0;
-            if (!timers[i].enabled && new_enabled) {
+            if (!was_enabled && new_enabled) {
+                timers[i].divider = 0;
                 timers[i].stage2 = 0;
                 timers[i].stage3 = 0;
             }
@@ -314,6 +373,8 @@ void APU::writeMem(uint16_t address, uint8_t data) {
     case 0x00F6:
     case 0x00F7:
         spc_to_cpu[address - 0x00F4] = data;
+        spc_port_write_counts[address - 0x00F4]++;
+        last_spc_port_writes[address - 0x00F4] = data;
         updateDriverReadyState();
         break;
     case 0x00FA:
@@ -385,7 +446,9 @@ void APU::tickTimers(int spc_cycles) {
             if (!timer.enabled) continue;
 
             timer.stage2 = (uint8_t)(timer.stage2 + 1);
-            if (timer.stage2 == timer.target) {
+            const bool hit_target = timer.target == 0 ? timer.stage2 == 0
+                                                      : timer.stage2 == timer.target;
+            if (hit_target) {
                 timer.stage2 = 0;
                 timer.stage3 = (uint8_t)((timer.stage3 + 1) & 0x0F);
             }
@@ -400,6 +463,12 @@ void APU::queueSample(int16_t left, int16_t right) {
     }
     audio_peak_sample = std::max(audio_peak_sample,
                                  std::max(std::abs((int)left), std::abs((int)right)));
+
+    recent_audio_mono[recent_audio_pos] = (int16_t)(((int)left + (int)right) / 2);
+    recent_audio_pos = (recent_audio_pos + 1) % recent_audio_mono.size();
+    if (recent_audio_pos == 0) {
+        recent_audio_filled = true;
+    }
 
     std::lock_guard<std::mutex> lock(audio_mutex);
     while (audio_fifo.size() > kMaxQueuedSamples) {
@@ -530,16 +599,34 @@ void APU::updateEnvelope(int voice_index) {
 }
 
 void APU::keyOn(uint8_t voice_mask) {
+    if (voice_mask != 0) {
+        key_on_count++;
+        last_key_on_mask = voice_mask;
+    }
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
-            resetVoice(voice_index);
+            Voice& voice = voices[voice_index];
+            voice = Voice{};
+            voice.releasing = false;
+            voice.key_on_pending = true;
+            voice.kon_delay = 5;
+
+            const int base = voice_index << 4;
+            dsp_regs[0x7C] &= (uint8_t)~(1u << voice_index);
+            dsp_regs[base + 8] = 0;
+            dsp_regs[base + 9] = 0;
         }
     }
 }
 
 void APU::keyOff(uint8_t voice_mask) {
+    if (voice_mask != 0) {
+        key_off_count++;
+        last_key_off_mask = voice_mask;
+    }
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
+            if (voices[voice_index].key_on_pending) continue;
             voices[voice_index].envelope_mode = EnvelopeMode::Release;
             voices[voice_index].releasing = true;
         }
@@ -588,6 +675,11 @@ void APU::resetVoice(int voice_index) {
 
     if (!decodeNextBlock(voice_index)) {
         voice.active = false;
+    } else if (!voice.decoded_samples.empty()) {
+        voice.decoded_samples.push_front(0);
+        voice.decoded_samples.push_front(0);
+        voice.decoded_samples.push_front(0);
+        voice.sample_index = std::min(3, (int)voice.decoded_samples.size() - 1);
     }
 }
 
@@ -631,19 +723,15 @@ bool APU::decodeNextBlock(int voice_index) {
         sample = clamp16(sample) & ~1;
         voice.prev2 = voice.prev1;
         voice.prev1 = (int16_t)sample;
-        voice.decoded[i] = (int16_t)sample;
+        voice.decoded_samples.push_back((int16_t)sample);
     }
 
-    voice.sample_index = 0;
     voice.stop_after_block = end && !loop;
     voice.next_block_addr = end && loop ? voice.loop_start
                                         : (uint16_t)(block_addr + 9);
 
     if (end) {
         dsp_regs[0x7C] |= (uint8_t)(1u << voice_index);
-        if (!loop) {
-            voice.releasing = true;
-        }
     }
 
     return true;
@@ -652,19 +740,23 @@ bool APU::decodeNextBlock(int voice_index) {
 int16_t APU::renderVoice(int voice_index) {
     Voice& voice = voices[voice_index];
     const int base = voice_index << 4;
+    if (voice.key_on_pending) {
+        dsp_regs[base + 8] = 0;
+        dsp_regs[base + 9] = 0;
+        if (voice.kon_delay > 0) {
+            voice.kon_delay--;
+            if (voice.kon_delay == 0) {
+                voice.key_on_pending = false;
+                resetVoice(voice_index);
+            }
+        }
+        return 0;
+    }
+
     if (!voice.active) {
         dsp_regs[base + 8] = 0;
         dsp_regs[base + 9] = 0;
         return 0;
-    }
-
-    if (voice.sample_index < 0 || voice.sample_index >= 16) {
-        if (!decodeNextBlock(voice_index)) {
-            voice.active = false;
-            dsp_regs[base + 8] = 0;
-            dsp_regs[base + 9] = 0;
-            return 0;
-        }
     }
 
     updateEnvelope(voice_index);
@@ -677,8 +769,49 @@ int16_t APU::renderVoice(int voice_index) {
     }
 
     const bool noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
-    int sample = noise_enabled ? (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF)
-                               : (int)voice.decoded[voice.sample_index];
+    int sample = 0;
+    if (noise_enabled) {
+        sample = (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF);
+    } else {
+        while (voice.active &&
+               !voice.stop_after_block &&
+               voice.sample_index >= (int)voice.decoded_samples.size()) {
+            if (!decodeNextBlock(voice_index)) {
+                voice.active = false;
+                dsp_regs[base + 8] = 0;
+                dsp_regs[base + 9] = 0;
+                return 0;
+            }
+        }
+
+        if (voice.sample_index >= (int)voice.decoded_samples.size()) {
+            voice.active = false;
+            voice.releasing = true;
+            voice.envelope = 0;
+            dsp_regs[base + 8] = 0;
+            dsp_regs[base + 9] = 0;
+            return 0;
+        }
+
+        auto sampleAt = [&voice](int index) {
+            index = clampIndex(index, 0, (int)voice.decoded_samples.size() - 1);
+            return voice.decoded_samples[(std::size_t)index];
+        };
+
+        const auto& gaussian = GaussianTable();
+        const int offset = (voice.interp_index >> 4) & 0xFF;
+        const int s0 = sampleAt(voice.sample_index - 3);
+        const int s1 = sampleAt(voice.sample_index - 2);
+        const int s2 = sampleAt(voice.sample_index - 1);
+        const int s3 = sampleAt(voice.sample_index + 0);
+
+        int interpolated = 0;
+        interpolated += (gaussian[0x0FF - offset] * s0) >> 11;
+        interpolated += (gaussian[0x1FF - offset] * s1) >> 11;
+        interpolated += (gaussian[0x100 + offset] * s2) >> 11;
+        interpolated += (gaussian[0x000 + offset] * s3) >> 11;
+        sample = clamp16(interpolated) & ~1;
+    }
     const int voice_output = clamp16((sample * (int)voice.envelope) >> 11);
     voice.last_output = (int16_t)voice_output;
 
@@ -698,12 +831,10 @@ int16_t APU::renderVoice(int voice_index) {
         while (voice.interp_index >= 0x1000 && voice.active) {
             voice.interp_index -= 0x1000;
             voice.sample_index++;
-            if (voice.sample_index >= 16) {
-                if (voice.stop_after_block) {
-                    voice.releasing = true;
-                    voice.sample_index = 15;
-                    break;
-                }
+
+            while (voice.active &&
+                   !voice.stop_after_block &&
+                   voice.sample_index >= (int)voice.decoded_samples.size()) {
                 if (!decodeNextBlock(voice_index)) {
                     voice.active = false;
                     dsp_regs[base + 8] = 0;
@@ -711,10 +842,38 @@ int16_t APU::renderVoice(int voice_index) {
                     return 0;
                 }
             }
+
+            if (voice.stop_after_block &&
+                voice.sample_index >= (int)voice.decoded_samples.size()) {
+                voice.active = false;
+                voice.releasing = true;
+                voice.envelope = 0;
+                dsp_regs[base + 8] = 0;
+                dsp_regs[base + 9] = 0;
+                return 0;
+            }
+
+            if (voice.sample_index > 24) {
+                const int trim = voice.sample_index - 24;
+                voice.decoded_samples.erase(voice.decoded_samples.begin(),
+                                            voice.decoded_samples.begin() + trim);
+                voice.sample_index -= trim;
+            }
         }
     }
 
     return (int16_t)voice_output;
+}
+
+int16_t APU::readSample16(uint16_t address) const {
+    const uint8_t lo = ram[address];
+    const uint8_t hi = ram[(uint16_t)(address + 1)];
+    return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+}
+
+void APU::writeSample16(uint16_t address, int16_t sample) {
+    ram[address] = (uint8_t)(sample & 0xFF);
+    ram[(uint16_t)(address + 1)] = (uint8_t)(((uint16_t)sample >> 8) & 0xFF);
 }
 
 void APU::synthesizeSamples(int spc_cycles) {
@@ -726,36 +885,79 @@ void APU::synthesizeSamples(int spc_cycles) {
 
         int mixed_left = 0;
         int mixed_right = 0;
+        int echo_left = 0;
+        int echo_right = 0;
+        const uint8_t echo_enable = dsp_regs[0x4D];
         for (int voice_index = 0; voice_index < 8; voice_index++) {
             const int base = voice_index << 4;
             const int voice_output = renderVoice(voice_index);
             const int8_t vol_left = (int8_t)dsp_regs[base + 0];
             const int8_t vol_right = (int8_t)dsp_regs[base + 1];
-            mixed_left = clamp16(mixed_left + ((voice_output * vol_left) >> 7));
-            mixed_right = clamp16(mixed_right + ((voice_output * vol_right) >> 7));
+            const int voice_left = (voice_output * vol_left) >> 7;
+            const int voice_right = (voice_output * vol_right) >> 7;
+            mixed_left = clamp16(mixed_left + voice_left);
+            mixed_right = clamp16(mixed_right + voice_right);
+            if ((echo_enable & (1u << voice_index)) != 0) {
+                echo_left = clamp16(echo_left + voice_left);
+                echo_right = clamp16(echo_right + voice_right);
+            }
         }
 
         const int8_t master_left = (int8_t)dsp_regs[0x0C];
         const int8_t master_right = (int8_t)dsp_regs[0x1C];
-        mixed_left = clamp16((mixed_left * master_left) >> 7);
-        mixed_right = clamp16((mixed_right * master_right) >> 7);
+        const int echo_delay = std::max(4, ((int)dsp_regs[0x7D] & 0x0F) * 2048);
+        const int echo_frames = std::max(1, echo_delay / 4);
+        const uint16_t echo_base = (uint16_t)dsp_regs[0x6D] << 8;
+        const uint16_t echo_addr = (uint16_t)(echo_base + ((dsp_sample_counter % (std::uint64_t)echo_frames) * 4));
+        const int16_t echo_sample_left = readSample16(echo_addr);
+        const int16_t echo_sample_right = readSample16((uint16_t)(echo_addr + 2));
+        const int8_t echo_vol_left = (int8_t)dsp_regs[0x2C];
+        const int8_t echo_vol_right = (int8_t)dsp_regs[0x3C];
+        echo_history_left[echo_history_pos] = echo_sample_left;
+        echo_history_right[echo_history_pos] = echo_sample_right;
+
+        auto filterEcho = [this](const std::array<int16_t, 8>& history) {
+            int filtered = 0;
+            for (int tap = 0; tap < 8; tap++) {
+                const std::size_t index = (echo_history_pos + 8 - tap) & 7;
+                const int8_t coeff = (int8_t)dsp_regs[0x0F + tap * 0x10];
+                filtered += ((int)history[index] * coeff) >> 7;
+            }
+            return clamp16(filtered);
+        };
+
+        const int filtered_echo_left = filterEcho(echo_history_left);
+        const int filtered_echo_right = filterEcho(echo_history_right);
+        mixed_left = clamp16(((mixed_left * master_left) >> 7) + ((filtered_echo_left * echo_vol_left) >> 7));
+        mixed_right = clamp16(((mixed_right * master_right) >> 7) + ((filtered_echo_right * echo_vol_right) >> 7));
+
+        if ((dsp_regs[0x6C] & 0x20) == 0) {
+            const int8_t echo_feedback = (int8_t)dsp_regs[0x0D];
+            const int feedback_left = clamp16(echo_left + ((filtered_echo_left * echo_feedback) >> 7));
+            const int feedback_right = clamp16(echo_right + ((filtered_echo_right * echo_feedback) >> 7));
+            writeSample16(echo_addr, (int16_t)feedback_left);
+            writeSample16((uint16_t)(echo_addr + 2), (int16_t)feedback_right);
+        }
 
         if (dsp_regs[0x6C] & 0x40) {
             mixed_left = 0;
             mixed_right = 0;
         }
 
+        echo_history_pos = (echo_history_pos + 1) & 7;
+        dsp_regs[0x4C] = 0;
         queueSample((int16_t)mixed_left, (int16_t)mixed_right);
     }
 }
 
 void APU::runCycles(int spc_cycles) {
-    while (spc_cycles > 0) {
+    spc_cycle_budget += spc_cycles;
+    while (spc_cycle_budget > 0) {
         int used = stepInstruction();
         if (used <= 0) used = 1;
         tickTimers(used);
         synthesizeSamples(used);
-        spc_cycles -= used;
+        spc_cycle_budget -= used;
     }
 }
 
@@ -857,6 +1059,28 @@ int APU::stepInstruction() {
     switch (opcode) {
     case 0x00:
         return 2;
+    case 0x01:
+    case 0x11:
+    case 0x21:
+    case 0x31:
+    case 0x41:
+    case 0x51:
+    case 0x61:
+    case 0x71:
+    case 0x81:
+    case 0x91:
+    case 0xA1:
+    case 0xB1:
+    case 0xC1:
+    case 0xD1:
+    case 0xE1:
+    case 0xF1: {
+        push((pc >> 8) & 0xFF);
+        push(pc & 0xFF);
+        const uint16_t vector = (uint16_t)(0xFFDE - (((opcode >> 4) & 0x0F) * 2));
+        pc = readWord(vector);
+        return 8;
+    }
     case 0x02:
     case 0x12:
     case 0x22:
@@ -953,7 +1177,9 @@ int APU::stepInstruction() {
     case 0x0E: {
         uint16_t addr = fetchWord();
         uint8_t value = readMem(addr);
-        cmp8(a, value);
+        const uint8_t result = (uint8_t)(a - value);
+        setFlag(kFlagZ, result == 0);
+        setFlag(kFlagN, (result & 0x80) != 0);
         writeMem(addr, (uint8_t)(value | a));
         return 6;
     }
@@ -962,6 +1188,7 @@ int APU::stepInstruction() {
         push((uint8_t)pc);
         push(psw);
         setFlag(kFlagB, true);
+        setFlag(kFlagI, false);
         pc = readWord(0xFFDE);
         return 8;
 
@@ -1188,6 +1415,13 @@ int APU::stepInstruction() {
     case 0x4D:
         push(x);
         return 4;
+    case 0x4F: {
+        const uint8_t up = fetchByte();
+        push((pc >> 8) & 0xFF);
+        push(pc & 0xFF);
+        pc = (uint16_t)(0xFF00 | up);
+        return 6;
+    }
     case 0x4C: {
         uint16_t addr = fetchWord();
         writeMem(addr, lsr8(readMem(addr)));
@@ -1202,7 +1436,9 @@ int APU::stepInstruction() {
     case 0x4E: {
         uint16_t addr = fetchWord();
         uint8_t value = readMem(addr);
-        cmp8(a, value);
+        const uint8_t result = (uint8_t)(a - value);
+        setFlag(kFlagZ, result == 0);
+        setFlag(kFlagN, (result & 0x80) != 0);
         writeMem(addr, (uint8_t)(value & (uint8_t)~a));
         return 6;
     }
@@ -1381,6 +1617,13 @@ int APU::stepInstruction() {
     case 0x7C:
         a = ror8(a);
         return 2;
+    case 0x7F: {
+        psw = pop();
+        uint8_t pcl = pop();
+        uint8_t pch = pop();
+        pc = (uint16_t)pcl | ((uint16_t)pch << 8);
+        return 6;
+    }
 
     case 0x80:
         setFlag(kFlagC, true);
@@ -1477,12 +1720,19 @@ int APU::stepInstruction() {
         uint16_t ya = (uint16_t)a | ((uint16_t)y << 8);
         setFlag(kFlagV, y >= x);
         setFlag(kFlagH, (x & 0x0F) <= (y & 0x0F));
-        if (x != 0) {
-            a = (uint8_t)(ya / x);
-            y = (uint8_t)(ya % x);
+        if (y < (uint8_t)(x << 1)) {
+            if (x != 0) {
+                a = (uint8_t)(ya / x);
+                y = (uint8_t)(ya % x);
+            } else {
+                a = 0xFF;
+                y = (uint8_t)(ya >> 8);
+            }
         } else {
-            a = 0xFF;
-            y = 0x00;
+            const uint16_t adjust = (uint16_t)(ya - ((uint16_t)x << 9));
+            const uint16_t divisor = (uint16_t)(0x100 - x);
+            a = (uint8_t)(0xFF - (adjust / divisor));
+            y = (uint8_t)(x + (adjust % divisor));
         }
         setNZ8(a);
         return 12;
@@ -1500,6 +1750,10 @@ int APU::stepInstruction() {
         a--;
         setNZ8(a);
         return 2;
+    case 0x9D:
+        x = sp;
+        setNZ8(x);
+        return 2;
 
     case 0xA4:
         sbc(readMem(directPageAddress(fetchByte())));
@@ -1516,6 +1770,9 @@ int APU::stepInstruction() {
     case 0xA8:
         sbc(fetchByte());
         return 2;
+    case 0xA0:
+        setFlag(kFlagI, true);
+        return 3;
     case 0xAB: {
         uint8_t direct = fetchByte();
         uint8_t value = (uint8_t)(readMem(directPageAddress(direct)) + 1);
@@ -1535,7 +1792,6 @@ int APU::stepInstruction() {
         return 2;
     case 0xAE:
         a = pop();
-        setNZ8(a);
         return 4;
     case 0xAF:
         writeMem(directPageAddress(x), a);
@@ -1588,6 +1844,9 @@ int APU::stepInstruction() {
     case 0xC4:
         writeMem(directPageAddress(fetchByte()), a);
         return 4;
+    case 0xC0:
+        setFlag(kFlagI, false);
+        return 3;
     case 0xC5:
         writeMem(fetchWord(), a);
         return 5;
@@ -1616,7 +1875,6 @@ int APU::stepInstruction() {
         return 2;
     case 0xCE:
         x = pop();
-        setNZ8(x);
         return 4;
     case 0xCF: {
         uint16_t result = (uint16_t)y * (uint16_t)a;
@@ -1723,7 +1981,6 @@ int APU::stepInstruction() {
         return 3;
     case 0xEE:
         y = pop();
-        setNZ8(y);
         return 4;
     case 0xEF:
         sleeping = true;
@@ -1770,7 +2027,6 @@ int APU::stepInstruction() {
     case 0xFE: {
         int8_t rel = (int8_t)fetchByte();
         y--;
-        setNZ8(y);
         if (y != 0) {
             pc = (uint16_t)(pc + rel);
             return 6;

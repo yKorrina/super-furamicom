@@ -12,9 +12,15 @@ public:
     uint8_t readRegister (uint16_t address);
     void    writeRegister(uint16_t address, uint8_t data);
     void    renderFrame  ();
+    void    beginFrame   ();
+    void    renderScanline(int scanline);
+    void    endFrame     ();
+    void    renderDebugFrame(uint8_t main_mask, uint8_t sub_mask, bool disable_color_math);
     
     void setVBlank(bool v) { vblank_flag = v; }
     bool getVBlank() const { return vblank_flag; }
+    void setHBlank(bool v) { hblank_flag = v; }
+    bool getHBlank() const { return hblank_flag; }
 
     const uint32_t* getFramebuffer() const { return framebuffer.data(); }
 
@@ -29,6 +35,7 @@ public:
     uint8_t  getCGWSEL()       const { return cgwsel; }
     uint8_t  getCGADSUB()      const { return cgadsub; }
     uint16_t getFixedColor()   const { return fixed_color; }
+    uint8_t  getSETINI()       const { return setini; }
     uint8_t  getW12SEL()       const { return w12sel; }
     uint8_t  getW34SEL()       const { return w34sel; }
     uint8_t  getWOBJSEL()      const { return wobjsel; }
@@ -92,6 +99,7 @@ private:
     uint8_t  cgwsel;
     uint8_t  cgadsub;
     uint16_t fixed_color;
+    uint8_t  setini;
     uint8_t  w12sel;
     uint8_t  w34sel;
     uint8_t  wobjsel;
@@ -108,12 +116,22 @@ private:
     uint16_t vram_prefetch;
 
     uint16_t m7a, m7b, m7c, m7d;
+    uint16_t m7x, m7y;
+    uint16_t m7hofs, m7vofs;
+    uint8_t  m7sel;
     uint32_t mpy_result;
 
     uint16_t ophct, opvct;
     bool     ophct_latch, opvct_latch;
+    uint16_t current_hcounter;
+    uint16_t current_vcounter;
 
     bool vblank_flag = false;
+    bool hblank_flag = false;
+    bool debug_override_masks = false;
+    bool debug_disable_color_math = false;
+    uint8_t debug_tm_main = 0;
+    uint8_t debug_tm_sub = 0;
 
     std::array<uint32_t, 256 * 224> framebuffer;
 
@@ -122,9 +140,15 @@ private:
     bool colorWindowActive(int x) const;
     bool colorWindowRegionEnabled(uint8_t region_mode, bool window_active) const;
     bool evaluateWindowMask(uint8_t select, uint8_t logic, int x) const;
-    void renderBG(int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source);
-    void renderSprites(int priority, bool main_screen, uint32_t* target, uint8_t* source);
+    bool cpuCanAccessVRAM() const;
+    bool cpuCanAccessOAM() const;
+    bool cpuCanAccessCGRAM() const;
+    void renderMode7(int scanline, bool main_screen, uint32_t* target, uint8_t* source);
+    void renderBG(int scanline, int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source);
+    void renderSprites(int scanline, int priority, bool main_screen, uint32_t* target, uint8_t* source);
     uint32_t colorFromCGRAM(uint16_t palette_offset);
+    uint32_t directColorFromMode7(uint8_t color_byte) const;
+    uint32_t directColorFromBG(uint8_t color_byte, uint8_t palette_bits) const;
 };
 
 #endif

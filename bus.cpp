@@ -12,6 +12,169 @@ Bus::Bus(CPU* c, PPU* p, APU* a) : cpu(c), ppu(p), apu(a) {
 
 void Bus::insertCartridge(Cartridge* cart) { cartridge = cart; }
 
+void Bus::beginFrame() {
+    irq_fired_this_scanline = false;
+    for (int i = 0; i < 8; i++) {
+        if (hdma_enable & (1 << i)) {
+            initializeHDMAChannel(i);
+            if (!dma[i].hdma_terminated && dma[i].hdma_do_transfer) {
+                transferHDMAChannel(i);
+                dma[i].hdma_do_transfer = (dma[i].line_counter & 0x80) != 0;
+            }
+        } else {
+            dma[i].hdma_do_transfer = false;
+            dma[i].hdma_terminated = true;
+            dma[i].line_counter = 0;
+        }
+    }
+}
+
+void Bus::startVBlank() {
+    nmi_pending = true;
+    auto_joypad_busy = false;
+}
+
+void Bus::endVBlank() {
+    nmi_pending = false;
+    auto_joypad_busy = false;
+}
+
+void Bus::beginScanline(int scanline) {
+    irq_fired_this_scanline = false;
+    const uint8_t irq_mode = (nmitimen >> 4) & 0x03;
+
+    if ((irq_mode == 2 || irq_mode == 3) && scanline == (int)(vtime & 0x01FF) && (htime & 0x01FF) == 0) {
+        irq_pending = true;
+        irq_fired_this_scanline = true;
+    }
+}
+
+void Bus::beginHBlank(int scanline) {
+    if (irq_fired_this_scanline) return;
+
+    const uint8_t irq_mode = (nmitimen >> 4) & 0x03;
+    switch (irq_mode) {
+    case 1:
+        irq_pending = true;
+        break;
+    case 3:
+        if (scanline == (int)(vtime & 0x01FF)) {
+            irq_pending = true;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (irq_pending) {
+        irq_fired_this_scanline = true;
+    }
+}
+
+bool Bus::consumeNMI() {
+    if (!nmi_enabled || !nmi_pending) return false;
+    nmi_pending = false;
+    return true;
+}
+
+bool Bus::consumeIRQ() {
+    if (!irq_pending) return false;
+    irq_pending = false;
+    return true;
+}
+
+void Bus::initializeHDMAChannel(int channel) {
+    dma[channel].table_address = (uint16_t)(dma[channel].src_address & 0xFFFF);
+    dma[channel].line_counter = 0;
+    dma[channel].hdma_do_transfer = false;
+    dma[channel].hdma_terminated = false;
+    reloadHDMALineCounter(channel);
+}
+
+void Bus::reloadHDMALineCounter(int channel) {
+    DMAChannel& ch = dma[channel];
+    const uint8_t table_bank = (uint8_t)((ch.src_address >> 16) & 0xFF);
+    const uint32_t base = ((uint32_t)table_bank << 16) | ch.table_address;
+    ch.line_counter = read(base);
+    ch.table_address++;
+
+    if (ch.line_counter == 0) {
+        ch.hdma_terminated = true;
+        ch.hdma_do_transfer = false;
+        return;
+    }
+
+    if (ch.control & 0x40) {
+        const uint32_t indirect_base = ((uint32_t)table_bank << 16) | ch.table_address;
+        const uint8_t low = read(indirect_base);
+        const uint8_t high = read(((uint32_t)table_bank << 16) | (uint16_t)(ch.table_address + 1));
+        ch.size = (uint16_t)low | ((uint16_t)high << 8);
+        ch.table_address += 2;
+    }
+
+    ch.hdma_do_transfer = true;
+}
+
+void Bus::transferHDMAChannel(int channel) {
+    static const uint8_t kBytesPerMode[8] = {1, 2, 2, 4, 4, 4, 2, 4};
+
+    DMAChannel& ch = dma[channel];
+    const uint8_t mode = ch.control & 0x07;
+    const uint8_t byte_count = kBytesPerMode[mode];
+    const bool direction = (ch.control & 0x80) != 0;
+    const bool indirect = (ch.control & 0x40) != 0;
+    const uint8_t table_bank = (uint8_t)((ch.src_address >> 16) & 0xFF);
+
+    for (uint8_t byte_index = 0; byte_index < byte_count; byte_index++) {
+        uint16_t b_reg = 0x2100 + ch.dest_reg;
+        switch (mode) {
+        case 0: break;
+        case 1: b_reg += (byte_index & 1); break;
+        case 2: break;
+        case 3: b_reg += ((byte_index >> 1) & 1); break;
+        case 4: b_reg += (byte_index & 3); break;
+        case 5: b_reg += (byte_index & 1); break;
+        case 6: break;
+        case 7: b_reg += ((byte_index >> 1) & 1); break;
+        default: break;
+        }
+
+        uint32_t src_full;
+        if (indirect) {
+            src_full = ((uint32_t)ch.indirect_bank << 16) | ch.size;
+            ch.size++;
+        } else {
+            src_full = ((uint32_t)table_bank << 16) | ch.table_address;
+            ch.table_address++;
+        }
+
+        if (!direction) write(b_reg, read(src_full));
+        else write(src_full, read(b_reg));
+    }
+}
+
+void Bus::stepHDMA() {
+    for (int i = 0; i < 8; i++) {
+        if ((hdma_enable & (1 << i)) == 0) continue;
+
+        DMAChannel& ch = dma[i];
+        if (ch.hdma_terminated) continue;
+
+        const bool repeat_mode = (ch.line_counter & 0x80) != 0;
+        if (ch.hdma_do_transfer) transferHDMAChannel(i);
+
+        uint8_t remaining = ch.line_counter & 0x7F;
+        if (remaining > 0) remaining--;
+
+        if (remaining == 0) {
+            reloadHDMALineCounter(i);
+        } else {
+            ch.line_counter = (uint8_t)((repeat_mode ? 0x80 : 0x00) | remaining);
+            ch.hdma_do_transfer = repeat_mode;
+        }
+    }
+}
+
 void Bus::setJoypadState(uint16_t pad1, uint16_t pad2) {
     joy1_state = pad1;
     joy2_state = pad2;
@@ -49,9 +212,21 @@ uint8_t Bus::read(uint32_t address) {
         }
         if (offset == 0x4016) return 0x00;
         if (offset == 0x4017) return 0x00;
-        if (offset == 0x4210) return ppu->getVBlank() ? 0x82 : 0x02;
-        if (offset == 0x4211) return 0x00;
-        if (offset == 0x4212) return (ppu->getVBlank() ? 0x80 : 0x00) | 0x01;
+        if (offset == 0x4210) {
+            const uint8_t value = (nmi_pending ? 0x80 : 0x00) | 0x02;
+            nmi_pending = false;
+            return value;
+        }
+        if (offset == 0x4211) {
+            const uint8_t value = irq_pending ? 0x80 : 0x00;
+            irq_pending = false;
+            return value;
+        }
+        if (offset == 0x4212) {
+            return (ppu->getVBlank() ? 0x80 : 0x00) |
+                   (ppu->getHBlank() ? 0x40 : 0x00) |
+                   (auto_joypad_busy ? 0x01 : 0x00);
+        }
         if (offset == 0x4214) return rddiv & 0xFF;
         if (offset == 0x4215) return (rddiv >> 8) & 0xFF;
         if (offset == 0x4216) return rdmpy & 0xFF;
@@ -72,6 +247,10 @@ uint8_t Bus::read(uint32_t address) {
                 case 0x04: return (dma[ch].src_address >> 16) & 0xFF;
                 case 0x05: return dma[ch].size & 0xFF;
                 case 0x06: return (dma[ch].size >> 8) & 0xFF;
+                case 0x07: return dma[ch].indirect_bank;
+                case 0x08: return dma[ch].table_address & 0xFF;
+                case 0x09: return (dma[ch].table_address >> 8) & 0xFF;
+                case 0x0A: return dma[ch].line_counter;
                 default:   return 0x00;
             }
         }
@@ -111,9 +290,20 @@ void Bus::write(uint32_t address, uint8_t data) {
             else        { rddiv = 0xFFFF; rdmpy = wrdivl; }
             return;
         }
-        if (offset == 0x4200) { nmi_enabled = (data & 0x80) != 0; return; }
+        if (offset == 0x4200) {
+            nmitimen = data;
+            nmi_enabled = (data & 0x80) != 0;
+            if ((data & 0x30) == 0) {
+                irq_pending = false;
+            }
+            return;
+        }
+        if (offset == 0x4207) { htime = (htime & 0x0100) | data; return; }
+        if (offset == 0x4208) { htime = (htime & 0x00FF) | (((uint16_t)data & 0x01) << 8); return; }
+        if (offset == 0x4209) { vtime = (vtime & 0x0100) | data; return; }
+        if (offset == 0x420A) { vtime = (vtime & 0x00FF) | (((uint16_t)data & 0x01) << 8); return; }
         if (offset == 0x420B) { executeDMA(data); return; }
-        if (offset == 0x420C) { return; }
+        if (offset == 0x420C) { hdma_enable = data; return; }
         if (offset >= 0x4300 && offset <= 0x437F) {
             uint8_t ch = (offset >> 4) & 0x07;
             uint8_t reg = offset & 0x0F;
@@ -125,6 +315,10 @@ void Bus::write(uint32_t address, uint8_t data) {
                 case 0x04: dma[ch].src_address = (dma[ch].src_address & 0x00FFFF) | ((uint32_t)data << 16); break;
                 case 0x05: dma[ch].size = (dma[ch].size & 0xFF00) | data; break;
                 case 0x06: dma[ch].size = (dma[ch].size & 0x00FF) | ((uint16_t)data << 8); break;
+                case 0x07: dma[ch].indirect_bank = data; break;
+                case 0x08: dma[ch].table_address = (dma[ch].table_address & 0xFF00) | data; break;
+                case 0x09: dma[ch].table_address = (dma[ch].table_address & 0x00FF) | ((uint16_t)data << 8); break;
+                case 0x0A: dma[ch].line_counter = data; break;
             }
             return;
         }
@@ -174,6 +368,8 @@ void Bus::executeDMA(uint8_t channels) {
                 case 3: b_reg += ((bytes_transferred >> 1) & 1); break;
                 case 4: b_reg += (bytes_transferred & 3); break;
                 case 5: b_reg += (bytes_transferred & 1); break;
+                case 6: break;
+                case 7: b_reg += ((bytes_transferred >> 1) & 1); break;
                 default: break;
             }
             

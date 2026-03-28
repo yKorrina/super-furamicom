@@ -51,9 +51,9 @@ Visualizer::~Visualizer() {
 }
 
 bool Visualizer::init() {
-    window = SDL_CreateWindow("Super Furamicom Debugger",
-        SDL_WINDOWPOS_CENTERED + 320, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("Super Furamicom Visualizer",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        WIN_W, WIN_H, SDL_WINDOW_HIDDEN);
     if (!window) return false;
 
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
@@ -72,6 +72,43 @@ bool Visualizer::init() {
     }
 
     return true;
+}
+
+void Visualizer::show() {
+    if (!window) return;
+    SDL_ShowWindow(window);
+}
+
+void Visualizer::placeBeside(SDL_Window* anchor, int gap) {
+    if (!window || !anchor) return;
+
+    int anchor_x = 0;
+    int anchor_y = 0;
+    int anchor_w = 0;
+    int anchor_h = 0;
+    SDL_GetWindowPosition(anchor, &anchor_x, &anchor_y);
+    SDL_GetWindowSize(anchor, &anchor_w, &anchor_h);
+
+    SDL_Rect usable_bounds{};
+    const int display_index = SDL_GetWindowDisplayIndex(anchor);
+    const bool have_bounds = display_index >= 0 &&
+        SDL_GetDisplayUsableBounds(display_index, &usable_bounds) == 0;
+
+    int target_x = anchor_x + anchor_w + gap;
+    int target_y = anchor_y;
+
+    if (have_bounds) {
+        if (target_x + WIN_W > usable_bounds.x + usable_bounds.w) {
+            target_x = anchor_x - WIN_W - gap;
+        }
+        if (target_x < usable_bounds.x) {
+            target_x = std::max(usable_bounds.x, usable_bounds.x + (usable_bounds.w - WIN_W) / 2);
+        }
+        target_y = std::clamp(target_y, usable_bounds.y,
+            usable_bounds.y + std::max(0, usable_bounds.h - WIN_H));
+    }
+
+    SDL_SetWindowPosition(window, target_x, target_y);
 }
 
 void Visualizer::destroy() {

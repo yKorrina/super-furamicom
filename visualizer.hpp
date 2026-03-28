@@ -16,6 +16,8 @@ public:
     ~Visualizer();
 
     bool init();
+    void show();
+    void placeBeside(SDL_Window* anchor, int gap = 24);
     void update(const CPU& cpu, const PPU& ppu, const APU& apu);
     void destroy();
     bool isOpen() const { return window != nullptr; }

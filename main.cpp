@@ -3,12 +3,17 @@
 #include "apu.hpp"
 #include "ppu.hpp"
 #include "cartridge.hpp"
+#include "launcher.hpp"
 #include "visualizer.hpp"
 #include <iostream>
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <filesystem>
+#include <vector>
+#include <string>
+#include <algorithm>
 #include <SDL2/SDL.h>
 
 static void SDLAudioCallback(void* userdata, Uint8* stream, int len) {
@@ -80,22 +85,105 @@ static bool WriteFramebufferBMP(const std::string& path, const uint32_t* framebu
     return (bool)out;
 }
 
+struct PadScriptRange {
+    int start_frame = 0;
+    int end_frame = 0;
+    uint16_t mask = 0;
+};
+
+static bool ParsePadScriptMask(const std::string& text, uint16_t& mask) {
+    if (text.empty()) return false;
+
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text.c_str(), &end, 16);
+    if (!end || *end != '\0' || value > 0xFFFFUL) return false;
+
+    mask = static_cast<uint16_t>(value);
+    return true;
+}
+
+static bool ParsePadScript(const std::string& spec, std::vector<PadScriptRange>& script) {
+    script.clear();
+    if (spec.empty()) return true;
+
+    size_t cursor = 0;
+    while (cursor < spec.size()) {
+        size_t next = spec.find(',', cursor);
+        if (next == std::string::npos) next = spec.size();
+
+        std::string token = spec.substr(cursor, next - cursor);
+        token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char c) {
+            return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+        }), token.end());
+
+        if (!token.empty()) {
+            const size_t colon = token.find(':');
+            if (colon == std::string::npos) return false;
+
+            const std::string range_text = token.substr(0, colon);
+            const std::string mask_text = token.substr(colon + 1);
+
+            int start = 0;
+            int end = 0;
+            const size_t dash = range_text.find('-');
+            try {
+                if (dash == std::string::npos) {
+                    start = end = std::stoi(range_text);
+                } else {
+                    start = std::stoi(range_text.substr(0, dash));
+                    end = std::stoi(range_text.substr(dash + 1));
+                }
+            } catch (...) {
+                return false;
+            }
+
+            if (start < 0 || end < start) return false;
+
+            uint16_t mask = 0;
+            if (!ParsePadScriptMask(mask_text, mask)) return false;
+            script.push_back({start, end, mask});
+        }
+
+        cursor = next + 1;
+    }
+
+    return true;
+}
+
+static uint16_t PadScriptMaskForFrame(const std::vector<PadScriptRange>& script, int frame) {
+    uint16_t mask = 0;
+    for (const auto& range : script) {
+        if (frame >= range.start_frame && frame <= range.end_frame) {
+            mask |= range.mask;
+        }
+    }
+    return mask;
+}
+
 class System {
 public:
     System() : bus(&cpu, &ppu, &apu) {}
 
-    void loadROM(const std::string& filepath) {
+    bool loadROM(const std::string& filepath) {
+        saveSRAM();
+        delete cartridge;
+        cartridge = nullptr;
         rom_filepath = filepath;
-        cartridge = new Cartridge(filepath);
-        if (cartridge->isLoaded()) {
+        Cartridge* next = new Cartridge(filepath);
+        if (next->isLoaded()) {
+            cartridge = next;
             bus.insertCartridge(cartridge);
             std::string srm = filepath + ".srm";
             cartridge->loadSRAM(srm);
             apu.reset();
-            cpu.reset(); 
+            cpu.reset();
             std::cout << "=== Super Furamicom Powered On ===\n";
+            return true;
         } else {
+            delete next;
             std::cerr << "Failed to load ROM: " << filepath << "\n";
+            rom_filepath.clear();
+            return false;
         }
     }
 
@@ -107,22 +195,51 @@ public:
         constexpr int VISIBLE_CYCLES = CYCLES_PER_FRAME - VBLANK_CYCLES;
 
         ppu.setVBlank(false);
-        int c = 0;
-        while (c < VISIBLE_CYCLES) {
-            int used = cpu.step();
-            c += used;
-            apu.tickCPUCycles(used);
-            if (cpu.isHalted()) break;
+        bus.endVBlank();
+        ppu.beginFrame();
+        ppu.setHBlank(true);
+        bus.beginFrame();
+        ppu.setHBlank(false);
+
+        int visible_elapsed = 0;
+        auto runVisibleTo = [&](int target_cycles) {
+            while (visible_elapsed < target_cycles) {
+                int used = cpu.step();
+                visible_elapsed += used;
+                apu.tickCPUCycles(used);
+                if (bus.consumeIRQ()) cpu.irq();
+                if (cpu.isHalted()) break;
+            }
+        };
+        runVisibleTo(VISIBLE_CYCLES / 225);
+
+        for (int scanline = 0; scanline < 224 && !cpu.isHalted(); scanline++) {
+            bus.beginScanline(scanline);
+            if (bus.consumeIRQ()) cpu.irq();
+            ppu.renderScanline(scanline);
+
+            if (scanline + 1 < 224) {
+                ppu.setHBlank(true);
+                bus.beginHBlank(scanline);
+                if (bus.consumeIRQ()) cpu.irq();
+                bus.stepHDMA();
+                ppu.setHBlank(false);
+            }
+
+            const int target_cycles = ((scanline + 2) * VISIBLE_CYCLES) / 225;
+            runVisibleTo(target_cycles);
         }
 
-        ppu.renderFrame();
-        if (bus.isNMIEnabled()) cpu.nmi();
+        ppu.endFrame();
+        bus.startVBlank();
+        if (bus.consumeNMI()) cpu.nmi();
 
-        c = 0;
+        int c = 0;
         while (c < VBLANK_CYCLES) {
             int used = cpu.step();
             c += used;
             apu.tickCPUCycles(used);
+            if (bus.consumeIRQ()) cpu.irq();
             if (cpu.isHalted()) break;
         }
 
@@ -146,6 +263,10 @@ public:
     void dumpDebugState(std::ostream& out) const {
         const auto& cpu_ports = apu.getCpuToSPCPorts();
         const auto& spc_ports = apu.getSPCToCpuPorts();
+        const auto& cpu_port_writes = apu.getCpuPortWriteCounts();
+        const auto& spc_port_writes = apu.getSpcPortWriteCounts();
+        const auto& last_cpu_writes = apu.getLastCpuPortWrites();
+        const auto& last_spc_writes = apu.getLastSpcPortWrites();
         out << "[CPU] PC=" << std::hex << cpu.getProgramCounter()
             << " A=" << cpu.getA() << " X=" << cpu.getX() << " Y=" << cpu.getY()
             << " SP=" << cpu.getSP() << " P=" << (unsigned)cpu.getP()
@@ -187,7 +308,20 @@ public:
             << " SP=" << (unsigned)apu.getSPCSP()
             << " PSW=" << (unsigned)apu.getSPCPSW()
             << " DSP_FLG=$" << (unsigned)apu.getDSPRegister(0x6C)
+            << " DSP_DIR=$" << (unsigned)apu.getDSPRegister(0x5D)
+            << " DSP_KOFF=$" << (unsigned)apu.getDSPRegister(0x5C)
             << " DSP_KON=$" << (unsigned)apu.getDSPRegister(0x4C)
+            << " DSP_NON=$" << (unsigned)apu.getDSPRegister(0x3D)
+            << " DSP_PMON=$" << (unsigned)apu.getDSPRegister(0x2D)
+            << " DSP_EON=$" << (unsigned)apu.getDSPRegister(0x4D)
+            << " DSP_ESA=$" << (unsigned)apu.getDSPRegister(0x6D)
+            << " DSP_EDL=$" << (unsigned)apu.getDSPRegister(0x7D)
+            << " KON_WRITES=" << std::dec << apu.getKeyOnCount()
+            << " KOF_WRITES=" << apu.getKeyOffCount()
+            << " LAST_KON=$" << std::hex << (unsigned)apu.getLastKeyOnMask()
+            << " LAST_KOF=$" << (unsigned)apu.getLastKeyOffMask()
+            << " DSP4C_WRITES=" << std::dec << apu.getDSPWriteCount(0x4C)
+            << " DSP5C_WRITES=" << apu.getDSPWriteCount(0x5C)
             << " audio_frames=" << std::dec << apu.getGeneratedAudioFrames()
             << " audio_nonzero=" << apu.getNonZeroAudioFrames()
             << " audio_peak=" << apu.getAudioPeakSample()
@@ -195,16 +329,75 @@ public:
             << std::hex
             << (unsigned)cpu_ports[0] << "," << (unsigned)cpu_ports[1] << ","
             << (unsigned)cpu_ports[2] << "," << (unsigned)cpu_ports[3]
+            << " cpu_port_writes="
+            << std::dec
+            << cpu_port_writes[0] << "," << cpu_port_writes[1] << ","
+            << cpu_port_writes[2] << "," << cpu_port_writes[3]
+            << " last_cpu_writes=$"
+            << std::hex
+            << (unsigned)last_cpu_writes[0] << "," << (unsigned)last_cpu_writes[1] << ","
+            << (unsigned)last_cpu_writes[2] << "," << (unsigned)last_cpu_writes[3]
             << " spc_ports="
             << (unsigned)spc_ports[0] << "," << (unsigned)spc_ports[1] << ","
             << (unsigned)spc_ports[2] << "," << (unsigned)spc_ports[3]
+            << " spc_port_writes="
+            << std::dec
+            << spc_port_writes[0] << "," << spc_port_writes[1] << ","
+            << spc_port_writes[2] << "," << spc_port_writes[3]
+            << " last_spc_writes=$"
+            << std::hex
+            << (unsigned)last_spc_writes[0] << "," << (unsigned)last_spc_writes[1] << ","
+            << (unsigned)last_spc_writes[2] << "," << (unsigned)last_spc_writes[3]
             << " unsupported=" << std::dec << apu.hasUnsupportedOpcode();
         if (apu.hasUnsupportedOpcode()) {
             out << " bad_op=$" << std::hex << (unsigned)apu.getUnsupportedOpcode()
                 << " bad_pc=$" << apu.getUnsupportedPC();
         }
-        out
-            << std::dec << "\n";
+        out << std::dec << "\n";
+
+        const auto voices = apu.getVoiceDebug();
+        for (int i = 0; i < 8; i++) {
+            out << "[APU-V" << i << "] active=" << voices[i].active
+                << " rel=" << voices[i].releasing
+                << " kon=" << voices[i].key_on_pending
+                << " src=$" << std::hex << (unsigned)voices[i].source_number
+                << " adsr1=$" << (unsigned)voices[i].adsr1
+                << " adsr2=$" << (unsigned)voices[i].adsr2
+                << " gain=$" << (unsigned)voices[i].gain
+                << " start=$" << voices[i].source_start
+                << " loop=$" << voices[i].loop_start
+                << " next=$" << voices[i].next_block_addr
+                << " pitch=$" << voices[i].pitch
+                << " env=$" << voices[i].envelope
+                << " out=" << std::dec << voices[i].last_output
+                << " vl=" << (int)voices[i].volume_left
+                << " vr=" << (int)voices[i].volume_right
+                << " envx=" << (unsigned)voices[i].envx
+                << " outx=" << (unsigned)voices[i].outx
+                << " noise=" << voices[i].noise_enabled
+                << " pmon=" << voices[i].pitch_mod_enabled
+                << "\n";
+        }
+
+        const auto timers = apu.getTimerDebug();
+        for (int i = 0; i < 3; i++) {
+            out << "[APU-T" << i << "] en=" << timers[i].enabled
+                << " target=" << (unsigned)timers[i].target
+                << " stage2=" << (unsigned)timers[i].stage2
+                << " out=" << (unsigned)timers[i].stage3
+                << " div=" << timers[i].divider
+                << " period=" << timers[i].period
+                << "\n";
+        }
+
+        const uint8_t* aram = apu.getRAMData();
+        const uint16_t spc_pc = apu.getSPCPC();
+        out << "[APU-PC] pc=$" << std::hex << spc_pc << " bytes=";
+        for (int i = 0; i < 8; i++) {
+            const uint16_t addr = (uint16_t)(spc_pc + i);
+            out << (i == 0 ? "" : " ") << (unsigned)aram[addr];
+        }
+        out << std::dec << "\n";
     }
 
     ~System() { saveSRAM(); delete cartridge; }
@@ -215,40 +408,34 @@ private:
     std::string rom_filepath;
 };
 
-uint16_t mapKeyboard(const uint8_t* keys) {
-    uint16_t pad = 0;
-    if (keys[SDL_SCANCODE_X])      pad |= 0x8000;
-    if (keys[SDL_SCANCODE_Z])      pad |= 0x4000;
-    if (keys[SDL_SCANCODE_RSHIFT] || keys[SDL_SCANCODE_BACKSPACE]) pad |= 0x2000;
-    if (keys[SDL_SCANCODE_RETURN]) pad |= 0x1000;
-    if (keys[SDL_SCANCODE_UP])     pad |= 0x0008;
-    if (keys[SDL_SCANCODE_DOWN])   pad |= 0x0004;
-    if (keys[SDL_SCANCODE_LEFT])   pad |= 0x0002;
-    if (keys[SDL_SCANCODE_RIGHT])  pad |= 0x0001;
-    if (keys[SDL_SCANCODE_S])      pad |= 0x0080;
-    if (keys[SDL_SCANCODE_A])      pad |= 0x0040;
-    if (keys[SDL_SCANCODE_Q])      pad |= 0x0800;
-    if (keys[SDL_SCANCODE_W])      pad |= 0x0400;
-    return pad;
+static void PrintUsage() {
+    std::cout << "Super Furamicom - SNES Emulator\n\n"
+              << "Usage: snes.exe [rom.sfc] [options]\n"
+              << "  --trace              CPU trace to trace.log\n"
+              << "  --visualize          Start with the visualizer open\n"
+              << "  --headless-frames N  Run N frames and exit\n"
+              << "  --pad1-script SPEC   Headless pad script, e.g. 0-15:1000,60-63:8000\n"
+              << "  --dump-frame PATH    Save the final frame as a BMP\n"
+              << "  --dump-state         Print CPU/PPU/APU state on exit\n\n"
+              << "When no ROM path is provided, the launcher scans ./roms and ./ for .sfc/.smc files.\n"
+              << "Controls can be remapped from the launcher, and F5 still toggles the visualizer in-game.\n";
+}
+
+static void AppendUniquePaths(std::vector<std::string>& target, const std::vector<std::string>& source) {
+    for (const auto& path : source) {
+        if (std::find(target.begin(), target.end(), path) == target.end()) {
+            target.push_back(path);
+        }
+    }
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cout << "Super Furamicom — SNES Emulator\n\n"
-                  << "Usage: snes_emu <rom.sfc> [options]\n"
-                  << "  --trace              CPU trace to trace.log\n"
-                  << "  --visualize          Open CPU/PPU/APU debugger\n"
-                  << "  --headless-frames N  Run N frames and exit\n"
-                  << "  --dump-state         Print CPU/PPU state\n\n"
-                  << "Controls:  Arrows=D-Pad  Z/X=Y/B  A/S=X/A  Q/W=L/R\n"
-                  << "  Enter=Start  Backspace=Select  Escape=Quit  F5=Visualizer\n";
-        return 1;
-    }
-
     bool do_trace = false, do_visualize = false, dump_state = false;
     int headless_frames = 0;
+    std::string rom_path;
     std::string dump_frame_path;
-    for (int i = 2; i < argc; i++) {
+    std::string pad1_script_spec;
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--trace") == 0) do_trace = true;
         else if (strcmp(argv[i], "--visualize") == 0) do_visualize = true;
         else if (strcmp(argv[i], "--dump-state") == 0) dump_state = true;
@@ -256,14 +443,47 @@ int main(int argc, char* argv[]) {
             dump_frame_path = argv[++i];
         else if (strcmp(argv[i], "--headless-frames") == 0 && (i+1) < argc)
             headless_frames = std::max(0, std::atoi(argv[++i]));
+        else if (strcmp(argv[i], "--pad1-script") == 0 && (i+1) < argc)
+            pad1_script_spec = argv[++i];
+        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            PrintUsage();
+            return 0;
+        } else if (argv[i][0] != '-' && rom_path.empty()) {
+            rom_path = argv[i];
+        } else {
+            std::cerr << "Unknown argument: " << argv[i] << "\n";
+            PrintUsage();
+            return 1;
+        }
+    }
+
+    if (rom_path.empty() && headless_frames > 0) {
+        std::cerr << "Headless mode requires a ROM path.\n";
+        PrintUsage();
+        return 1;
+    }
+
+    std::vector<PadScriptRange> pad1_script;
+    if (!ParsePadScript(pad1_script_spec, pad1_script)) {
+        std::cerr << "[INPUT] Invalid --pad1-script format. Use frame[-frame]:mask, e.g. 0-15:1000,60-63:8000\n";
+        return 1;
     }
 
     System snes;
     if (do_trace) { snes.enableTrace("trace.log"); std::cout << "[TRACE] Writing to trace.log\n"; }
-    snes.loadROM(argv[1]);
+    InputConfig input_config = DefaultInputConfig();
+    const std::string controls_path = "controls.cfg";
+    LoadInputConfig(controls_path, input_config);
+
+    if (!rom_path.empty() && !snes.loadROM(rom_path)) {
+        return 1;
+    }
 
     if (headless_frames > 0) {
-        for (int i = 0; i < headless_frames && !snes.isCPUHalted(); i++) snes.stepFrame();
+        for (int i = 0; i < headless_frames && !snes.isCPUHalted(); i++) {
+            snes.setJoypad(PadScriptMaskForFrame(pad1_script, i));
+            snes.stepFrame();
+        }
         if (!dump_frame_path.empty()) {
             if (!WriteFramebufferBMP(dump_frame_path, snes.getFramebuffer())) {
                 std::cerr << "[FRAME] Failed to write " << dump_frame_path << "\n";
@@ -273,17 +493,66 @@ int main(int argc, char* argv[]) {
         return snes.isCPUHalted() ? 2 : 0;
     }
 
-    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
 
     SDL_Window* window = SDL_CreateWindow("Super Furamicom",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         256*3, 224*3, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    if (!window) {
+        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
+        SDL_Quit();
+        return 1;
+    }
+
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    if (!renderer) {
+        std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << "\n";
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
     SDL_RenderSetLogicalSize(renderer, 256, 224);
     SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING, 256, 224);
+    if (!texture) {
+        std::cerr << "SDL_CreateTexture failed: " << SDL_GetError() << "\n";
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
     uint32_t main_wid = SDL_GetWindowID(window);
+
+    if (rom_path.empty()) {
+        std::vector<std::string> rom_paths;
+        AppendUniquePaths(rom_paths, DiscoverROMs("roms"));
+        AppendUniquePaths(rom_paths, DiscoverROMs("."));
+        LauncherResult launcher = RunLauncher(window, renderer, texture, rom_paths, controls_path, input_config, do_visualize);
+        if (!launcher.launch_requested) {
+            SDL_DestroyTexture(texture);
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 0;
+        }
+
+        input_config = launcher.input_config;
+        do_visualize = launcher.visualize;
+        rom_path = launcher.rom_path;
+        if (!snes.loadROM(rom_path)) {
+            SDL_DestroyTexture(texture);
+            SDL_DestroyRenderer(renderer);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 1;
+        }
+        SDL_SetWindowTitle(window, "Super Furamicom");
+    }
 
     SDL_AudioSpec desired = {};
     desired.freq = APU::kOutputHz; desired.format = AUDIO_S16SYS;
@@ -296,7 +565,12 @@ int main(int argc, char* argv[]) {
     if (do_visualize) {
         viz = new Visualizer();
         if (!viz->init()) { delete viz; viz = nullptr; }
-        else std::cout << "[VIZ] Debugger active (1=CPU 2=PPU 3=APU)\n";
+        else {
+            viz->placeBeside(window);
+            viz->show();
+            SDL_RaiseWindow(window);
+            std::cout << "[VIZ] Visualizer active (1=CPU 2=PPU 3=APU)\n";
+        }
     }
 
     bool running = true;
@@ -340,7 +614,12 @@ int main(int argc, char* argv[]) {
                     if (!viz) {
                         viz = new Visualizer();
                         if (!viz->init()) { delete viz; viz = nullptr; }
-                        else std::cout << "[VIZ] Opened\n";
+                        else {
+                            viz->placeBeside(window);
+                            viz->show();
+                            SDL_RaiseWindow(window);
+                            std::cout << "[VIZ] Opened\n";
+                        }
                     } else {
                         viz->destroy(); delete viz; viz = nullptr;
                         std::cout << "[VIZ] Closed\n";
@@ -350,7 +629,7 @@ int main(int argc, char* argv[]) {
         }
 
         const uint8_t* keys = SDL_GetKeyboardState(NULL);
-        snes.setJoypad(mapKeyboard(keys));
+        snes.setJoypad(MapInputConfigToPad(keys, input_config));
         snes.stepFrame();
 
         SDL_UpdateTexture(texture, NULL, snes.getFramebuffer(), 256*sizeof(uint32_t));

@@ -20,6 +20,11 @@ inline uint32_t objNameGapWordAddress(uint8_t gap_bits) {
 inline uint16_t wrapVRAMWordAddress(uint32_t word_address) {
     return (uint16_t)(word_address & 0x7FFF);
 }
+
+inline int signExtend13(uint16_t value) {
+    value &= 0x1FFF;
+    return (value & 0x1000) ? (int)(value | 0xE000) : (int)value;
+}
 }
 
 PPU::PPU() {
@@ -34,6 +39,8 @@ PPU::PPU() {
     inidisp = 0x80;
     m7a = m7b = m7c = m7d = 0; mpy_result = 0;
     ophct = opvct = 0; ophct_latch = opvct_latch = false;
+    current_hcounter = 0;
+    current_vcounter = 0;
 
     memset(bg_sc, 0, sizeof(bg_sc));
     memset(bg_nba, 0, sizeof(bg_nba));
@@ -43,10 +50,13 @@ PPU::PPU() {
     bg_hofs_latch = 0;
     tm_main = 0; tm_sub = 0;
     tmw_main = 0; tsw_sub = 0;
-    cgwsel = 0; cgadsub = 0; fixed_color = 0;
+    cgwsel = 0; cgadsub = 0; fixed_color = 0; setini = 0;
     w12sel = 0; w34sel = 0; wobjsel = 0;
     wbglog = 0; wobjlog = 0;
     wh0 = 0; wh1 = 0; wh2 = 0; wh3 = 0;
+    m7x = m7y = 0;
+    m7hofs = m7vofs = 0;
+    m7sel = 0;
     framebuffer.fill(0);
 }
 
@@ -81,6 +91,8 @@ uint8_t PPU::readRegister(uint16_t address) {
     case 0x2136: return (mpy_result >> 16) & 0xFF;
 
     case 0x2137:
+        ophct = current_hcounter;
+        opvct = current_vcounter;
         ophct_latch = false; opvct_latch = false;
         return 0x00;
 
@@ -159,13 +171,13 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
 
     case 0x2104:
         if (oam_write_address >= 0x200) {
-            if (oam_write_address < (int)oam.size()) oam[oam_write_address] = data;
+            if (cpuCanAccessOAM() && oam_write_address < (int)oam.size()) oam[oam_write_address] = data;
             oam_write_address++;
         } else if (!oam_latch) {
             oam_buffer = data; oam_latch = true;
         } else {
-            if (oam_write_address < (int)oam.size()) oam[oam_write_address] = oam_buffer;
-            if (oam_write_address + 1 < (int)oam.size()) oam[oam_write_address + 1] = data;
+            if (cpuCanAccessOAM() && oam_write_address < (int)oam.size()) oam[oam_write_address] = oam_buffer;
+            if (cpuCanAccessOAM() && oam_write_address + 1 < (int)oam.size()) oam[oam_write_address + 1] = data;
             oam_write_address += 2; oam_latch = false;
         }
         break;
@@ -179,11 +191,16 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
     case 0x210C: bg_nba[1] = data; break;
 
     case 0x210D:
+        m7hofs = ((uint16_t)data << 8) | bg_scroll_latch;
         bg_hofs[0] = ((uint16_t)data << 8) | (bg_scroll_latch & ~7) | (bg_hofs_latch & 0x07);
         bg_scroll_latch = data;
         bg_hofs_latch = data;
         break;
-    case 0x210E: bg_vofs[0] = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
+    case 0x210E:
+        m7vofs = ((uint16_t)data << 8) | bg_scroll_latch;
+        bg_vofs[0] = (data << 8) | bg_scroll_latch;
+        bg_scroll_latch = data;
+        break;
     case 0x210F:
         bg_hofs[1] = ((uint16_t)data << 8) | (bg_scroll_latch & ~7) | (bg_hofs_latch & 0x07);
         bg_scroll_latch = data;
@@ -204,6 +221,7 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
     case 0x2114: bg_vofs[3] = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
 
     case 0x2115: vmain = data; break;
+    case 0x211A: m7sel = data; break;
 
     // ══════════════════════════════════════════════════════════════════════
     //  VRAM address set — apply translation for prefetch
@@ -227,7 +245,7 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
     case 0x2118: {
         uint16_t ta = translateVRAMAddress(vram_address);
         uint32_t ba = (uint32_t)ta * 2;
-        vram[ba] = data;
+        if (cpuCanAccessVRAM()) vram[ba] = data;
         if ((vmain & 0x80) == 0) {
             uint8_t inc = vmain & 0x03;
             vram_address = (vram_address + ((inc == 0) ? 1 : (inc == 1) ? 32 : 128)) & 0x7FFF;
@@ -237,7 +255,7 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
     case 0x2119: {
         uint16_t ta = translateVRAMAddress(vram_address);
         uint32_t ba = (uint32_t)ta * 2 + 1;
-        vram[ba] = data;
+        if (cpuCanAccessVRAM()) vram[ba] = data;
         if ((vmain & 0x80) != 0) {
             uint8_t inc = vmain & 0x03;
             vram_address = (vram_address + ((inc == 0) ? 1 : (inc == 1) ? 32 : 128)) & 0x7FFF;
@@ -251,13 +269,18 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
         mpy_result = (int16_t)m7a * (int8_t)(m7b >> 8); break;
     case 0x211D: m7c = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
     case 0x211E: m7d = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
+    case 0x211F: m7x = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
+    case 0x2120: m7y = (data << 8) | bg_scroll_latch; bg_scroll_latch = data; break;
 
     case 0x2121: cgram_address = data; cgram_latch = false; break;
     case 0x2122:
         if (!cgram_latch) { cgram_buffer = data; cgram_latch = true; }
         else {
             uint16_t idx = (uint16_t)cgram_address * 2;
-            if (idx + 1 < (int)cgram.size()) { cgram[idx] = cgram_buffer; cgram[idx+1] = data; }
+            if (cpuCanAccessCGRAM() && idx + 1 < (int)cgram.size()) {
+                cgram[idx] = cgram_buffer;
+                cgram[idx+1] = data;
+            }
             cgram_address++; cgram_latch = false;
         }
         break;
@@ -284,6 +307,7 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
         if (data & 0x80) fixed_color = (fixed_color & ~0x7C00) | (value << 10);
         break;
     }
+    case 0x2133: setini = data; break;
 
     default: break;
     }
@@ -293,6 +317,40 @@ void PPU::writeRegister(uint16_t address, uint8_t data) {
 uint32_t PPU::colorFromCGRAM(uint16_t cg_idx) {
     if (cg_idx * 2 + 1 >= cgram.size()) return 0xFF000000u;
     uint16_t c15 = (uint16_t)cgram[cg_idx*2] | ((uint16_t)cgram[cg_idx*2+1] << 8);
+    uint8_t r = (uint8_t)((c15 & 0x001F) << 3); r |= (r >> 5);
+    uint8_t g = (uint8_t)(((c15 >> 5) & 0x1F) << 3); g |= (g >> 5);
+    uint8_t b = (uint8_t)(((c15 >> 10) & 0x1F) << 3); b |= (b >> 5);
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+bool PPU::cpuCanAccessVRAM() const {
+    return vblank_flag || (inidisp & 0x80) != 0;
+}
+
+bool PPU::cpuCanAccessOAM() const {
+    return vblank_flag || (inidisp & 0x80) != 0;
+}
+
+bool PPU::cpuCanAccessCGRAM() const {
+    return vblank_flag || hblank_flag || (inidisp & 0x80) != 0;
+}
+
+uint32_t PPU::directColorFromMode7(uint8_t color_byte) const {
+    const uint16_t r5 = (uint16_t)((color_byte & 0x07) << 2);
+    const uint16_t g5 = (uint16_t)(((color_byte >> 3) & 0x07) << 2);
+    const uint16_t b5 = (uint16_t)(((color_byte >> 6) & 0x03) << 3);
+    const uint16_t c15 = (uint16_t)(r5 | (g5 << 5) | (b5 << 10));
+    uint8_t r = (uint8_t)((c15 & 0x001F) << 3); r |= (r >> 5);
+    uint8_t g = (uint8_t)(((c15 >> 5) & 0x1F) << 3); g |= (g >> 5);
+    uint8_t b = (uint8_t)(((c15 >> 10) & 0x1F) << 3); b |= (b >> 5);
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+
+uint32_t PPU::directColorFromBG(uint8_t color_byte, uint8_t palette_bits) const {
+    const uint16_t r5 = (uint16_t)(((color_byte & 0x07) << 2) | ((palette_bits & 0x01) << 1));
+    const uint16_t g5 = (uint16_t)((((color_byte >> 3) & 0x07) << 2) | (palette_bits & 0x02));
+    const uint16_t b5 = (uint16_t)((((color_byte >> 6) & 0x03) << 3) | ((palette_bits & 0x04) << 0));
+    const uint16_t c15 = (uint16_t)(r5 | (g5 << 5) | (b5 << 10));
     uint8_t r = (uint8_t)((c15 & 0x001F) << 3); r |= (r >> 5);
     uint8_t g = (uint8_t)(((c15 >> 5) & 0x1F) << 3); g |= (g >> 5);
     uint8_t b = (uint8_t)(((c15 >> 10) & 0x1F) << 3); b |= (b >> 5);
@@ -366,22 +424,103 @@ bool PPU::colorWindowActive(int x) const {
 bool PPU::colorWindowRegionEnabled(uint8_t region_mode, bool window_active) const {
     switch (region_mode & 0x03) {
     case 0: return false;
-    case 1: return window_active;
-    case 2: return !window_active;
+    case 1: return !window_active;
+    case 2: return window_active;
     case 3: return true;
     }
     return false;
 }
 
+void PPU::beginFrame() {
+    vblank_flag = false;
+    hblank_flag = false;
+    current_hcounter = 0;
+    current_vcounter = 0;
+    ophct = 0;
+    opvct = 0;
+    ophct_latch = false;
+    opvct_latch = false;
+    if (inidisp & 0x80) {
+        framebuffer.fill(0xFF000000u);
+    }
+}
+
+void PPU::endFrame() {
+    hblank_flag = false;
+    vblank_flag = true;
+    current_hcounter = 0;
+    current_vcounter = 224;
+}
+
+void PPU::renderMode7(int scanline, bool main_screen, uint32_t* target, uint8_t* source) {
+    if (scanline < 0 || scanline >= 224) return;
+
+    const bool direct_color = (cgwsel & 0x01) != 0;
+    const bool no_repeat = (m7sel & 0x80) != 0;
+    const bool fill_tile0 = (m7sel & 0x40) != 0;
+    const bool flip_y = (m7sel & 0x02) != 0;
+    const bool flip_x = (m7sel & 0x01) != 0;
+
+    const int hofs = signExtend13(m7hofs);
+    const int vofs = signExtend13(m7vofs);
+    const int center_x = signExtend13(m7x);
+    const int center_y = signExtend13(m7y);
+    const int a = (int16_t)m7a;
+    const int b = (int16_t)m7b;
+    const int c = (int16_t)m7c;
+    const int d = (int16_t)m7d;
+
+    const int screen_y = flip_y ? 255 - (scanline + 1) : (scanline + 1);
+    for (int scr_x = 0; scr_x < 256; scr_x++) {
+        if (layerWindowMasked(0, main_screen, scr_x)) continue;
+
+        const int screen_x = flip_x ? 255 - scr_x : scr_x;
+        int tx = (a * (screen_x + hofs - center_x) + b * (screen_y + vofs - center_y) + (center_x << 8)) >> 8;
+        int ty = (c * (screen_x + hofs - center_x) + d * (screen_y + vofs - center_y) + (center_y << 8)) >> 8;
+
+        const bool outside = tx < 0 || tx > 1023 || ty < 0 || ty > 1023;
+        uint8_t tile = 0;
+        int pixel_x = tx & 0x07;
+        int pixel_y = ty & 0x07;
+
+        if (!no_repeat) {
+            tx &= 0x03FF;
+            ty &= 0x03FF;
+        } else if (outside) {
+            if (!fill_tile0) continue;
+        }
+
+        if (!outside || !no_repeat) {
+            const uint16_t map_word = wrapVRAMWordAddress((uint32_t)((ty >> 3) * 128 + (tx >> 3)));
+            tile = vram[map_word * 2];
+            pixel_x = tx & 0x07;
+            pixel_y = ty & 0x07;
+        }
+
+        const uint16_t pixel_word = wrapVRAMWordAddress((uint32_t)tile * 64 + (uint32_t)pixel_y * 8 + pixel_x);
+        const uint8_t color = vram[pixel_word * 2 + 1];
+        if (color == 0) continue;
+
+        target[scr_x] = direct_color ? directColorFromMode7(color) : colorFromCGRAM(color);
+        source[scr_x] = 1;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Background Rendering
 // ─────────────────────────────────────────────────────────────────────────────
-void PPU::renderBG(int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source) {
+void PPU::renderBG(int scanline, int bg_num, int bpp, bool high_priority, bool main_screen, uint32_t* target, uint8_t* source) {
+    if (scanline < 0 || scanline >= 224) return;
+
     // BGxSC stores the tilemap base as a word address in 0x400-word units.
     uint32_t map_base = ((bg_sc[bg_num] >> 2) & 0x3F) * 0x400;
     uint8_t sc_size = bg_sc[bg_num] & 0x03;
-    bool large_tiles = ((bgmode >> (4 + bg_num)) & 0x01) != 0;
-    int cell_size = large_tiles ? 16 : 8;
+    const bool large_tiles = ((bgmode >> (4 + bg_num)) & 0x01) != 0;
+    const uint8_t mode = bgmode & 0x07;
+    const bool wide_tiles = large_tiles || mode == 5 || mode == 6;
+    const bool tall_tiles = large_tiles;
+    const int cell_w = wide_tiles ? 16 : 8;
+    const int cell_h = tall_tiles ? 16 : 8;
     int map_w = (sc_size & 0x01) ? 64 : 32;
     int map_h = (sc_size & 0x02) ? 64 : 32;
 
@@ -399,79 +538,79 @@ void PPU::renderBG(int bg_num, int bpp, bool high_priority, bool main_screen, ui
     uint16_t sx = bg_hofs[bg_num] & 0x03FF;
     uint16_t sy = bg_vofs[bg_num] & 0x03FF;
 
-    for (int scr_y = 0; scr_y < 224; scr_y++) {
-        // The SNES blanks the first BG scanline, so the top visible line samples
-        // from one line below the nominal scroll origin.
-        int y = (scr_y + sy + 1) & ((map_h * cell_size) - 1);
-        int ty = y / cell_size, fy = y % cell_size;
+    // The SNES blanks the first BG scanline, so the top visible line samples
+    // from one line below the nominal scroll origin.
+    int y = (scanline + sy + 1) & ((map_h * cell_h) - 1);
+    int ty = y / cell_h, fy = y % cell_h;
 
-        for (int scr_x = 0; scr_x < 256; scr_x++) {
-            if (layerWindowMasked(bg_num, main_screen, scr_x)) continue;
+    for (int scr_x = 0; scr_x < 256; scr_x++) {
+        if (layerWindowMasked(bg_num, main_screen, scr_x)) continue;
 
-            int x = (scr_x + sx) & ((map_w * cell_size) - 1);
-            int tx = x / cell_size, fx = x % cell_size;
+        int x = (scr_x + sx) & ((map_w * cell_w) - 1);
+        int tx = x / cell_w, fx = x % cell_w;
 
-            uint32_t sb = 0;
-            int ltx = tx, lty = ty;
-            if (map_w == 64 && tx >= 32) { sb += 1; ltx -= 32; }
-            if (map_h == 64 && ty >= 32) { sb += (map_w == 64) ? 2 : 1; lty -= 32; }
+        uint32_t sb = 0;
+        int ltx = tx, lty = ty;
+        if (map_w == 64 && tx >= 32) { sb += 1; ltx -= 32; }
+        if (map_h == 64 && ty >= 32) { sb += (map_w == 64) ? 2 : 1; lty -= 32; }
 
-            uint32_t mw = wrapVRAMWordAddress(map_base + sb * 0x400 + (uint32_t)lty * 32 + ltx);
+        uint32_t mw = wrapVRAMWordAddress(map_base + sb * 0x400 + (uint32_t)lty * 32 + ltx);
 
-            uint16_t entry = (uint16_t)vram[mw*2] | ((uint16_t)vram[mw*2+1] << 8);
-            uint16_t tnum = entry & 0x03FF;
-            uint8_t  pal = (entry >> 10) & 0x07;
-            bool pri = (entry & 0x2000) != 0;
-            bool hf = (entry & 0x4000), vf = (entry & 0x8000);
-            if (pri != high_priority) continue;
+        uint16_t entry = (uint16_t)vram[mw*2] | ((uint16_t)vram[mw*2+1] << 8);
+        uint16_t tnum = entry & 0x03FF;
+        uint8_t  pal = (entry >> 10) & 0x07;
+        bool pri = (entry & 0x2000) != 0;
+        bool hf = (entry & 0x4000), vf = (entry & 0x8000);
+        if (pri != high_priority) continue;
 
-            int local_x = hf ? (cell_size - 1 - fx) : fx;
-            int local_y = vf ? (cell_size - 1 - fy) : fy;
-            int subtile_x = local_x >> 3;
-            int subtile_y = local_y >> 3;
-            int row = local_y & 0x07;
-            int bit = 7 - (local_x & 0x07);
+        int local_x = hf ? (cell_w - 1 - fx) : fx;
+        int local_y = vf ? (cell_h - 1 - fy) : fy;
+        int subtile_x = local_x >> 3;
+        int subtile_y = local_y >> 3;
+        int row = local_y & 0x07;
+        int bit = 7 - (local_x & 0x07);
 
-            if (large_tiles)
-                tnum = (tnum + subtile_x + subtile_y * 16) & 0x03FF;
+        if (wide_tiles || tall_tiles)
+            tnum = (tnum + subtile_x + subtile_y * 16) & 0x03FF;
 
-            uint32_t tw = wrapVRAMWordAddress(tile_base + (uint32_t)tnum * wpt);
-            uint32_t bp01 = wrapVRAMWordAddress(tw + row);
+        uint32_t tw = wrapVRAMWordAddress(tile_base + (uint32_t)tnum * wpt);
+        uint32_t bp01 = wrapVRAMWordAddress(tw + row);
 
-            uint8_t b0 = vram[bp01*2], b1 = vram[bp01*2+1];
-            uint8_t b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, b7 = 0;
-            if (bpp >= 4) {
-                uint32_t bp23 = wrapVRAMWordAddress(tw + 8 + row);
-                b2 = vram[bp23*2];
-                b3 = vram[bp23*2+1];
-            }
-            if (bpp == 8) {
-                uint32_t bp45 = wrapVRAMWordAddress(tw + 16 + row);
-                uint32_t bp67 = wrapVRAMWordAddress(tw + 24 + row);
-                b4 = vram[bp45*2];
-                b5 = vram[bp45*2+1];
-                b6 = vram[bp67*2];
-                b7 = vram[bp67*2+1];
-            }
-
-            uint8_t ci = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
-            if (bpp >= 4) ci |= (((b2 >> bit) & 1) << 2) | (((b3 >> bit) & 1) << 3);
-            if (bpp == 8) ci |= (((b4 >> bit) & 1) << 4) | (((b5 >> bit) & 1) << 5)
-                              | (((b6 >> bit) & 1) << 6) | (((b7 >> bit) & 1) << 7);
-            if (ci == 0) continue;
-
-            uint16_t cg = (bpp == 8) ? ci : (uint16_t)pal * pe + ci + pal_base;
-            size_t pixel = (size_t)scr_y * 256 + scr_x;
-            target[pixel] = colorFromCGRAM(cg);
-            source[pixel] = (uint8_t)(bg_num + 1);
+        uint8_t b0 = vram[bp01*2], b1 = vram[bp01*2+1];
+        uint8_t b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, b7 = 0;
+        if (bpp >= 4) {
+            uint32_t bp23 = wrapVRAMWordAddress(tw + 8 + row);
+            b2 = vram[bp23*2];
+            b3 = vram[bp23*2+1];
         }
+        if (bpp == 8) {
+            uint32_t bp45 = wrapVRAMWordAddress(tw + 16 + row);
+            uint32_t bp67 = wrapVRAMWordAddress(tw + 24 + row);
+            b4 = vram[bp45*2];
+            b5 = vram[bp45*2+1];
+            b6 = vram[bp67*2];
+            b7 = vram[bp67*2+1];
+        }
+
+        uint8_t ci = ((b0 >> bit) & 1) | (((b1 >> bit) & 1) << 1);
+        if (bpp >= 4) ci |= (((b2 >> bit) & 1) << 2) | (((b3 >> bit) & 1) << 3);
+        if (bpp == 8) ci |= (((b4 >> bit) & 1) << 4) | (((b5 >> bit) & 1) << 5)
+                          | (((b6 >> bit) & 1) << 6) | (((b7 >> bit) & 1) << 7);
+        if (ci == 0) continue;
+
+        const bool direct_color = bpp == 8 && bg_num == 0 && (cgwsel & 0x01) != 0 && (mode == 3 || mode == 4);
+        uint16_t cg = (bpp == 8) ? ci : (uint16_t)pal * pe + ci + pal_base;
+        target[scr_x] = direct_color ? directColorFromBG(ci, pal) : colorFromCGRAM(cg);
+        source[scr_x] = (uint8_t)(bg_num + 1);
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Sprite Rendering
 // ─────────────────────────────────────────────────────────────────────────────
-void PPU::renderSprites(int priority, bool main_screen, uint32_t* target, uint8_t* source) {
+void PPU::renderSprites(int scanline, int priority, bool main_screen, uint32_t* target, uint8_t* source) {
+    if (scanline < 0 || scanline >= 224) return;
+
     static const int obj_sizes[8][2][2] = {
         {{8,8},{16,16}}, {{8,8},{32,32}}, {{8,8},{64,64}}, {{16,16},{32,32}},
         {{16,16},{64,64}}, {{32,32},{64,64}}, {{16,32},{32,64}}, {{16,32},{32,32}},
@@ -494,59 +633,86 @@ void PPU::renderSprites(int priority, bool main_screen, uint32_t* target, uint8_
         bool hf = (attr & 0x40), vf = (attr & 0x80);
         uint8_t pal = (attr >> 1) & 0x07;
 
-        for (int py = 0; py < oh; py++) {
-            int scr_y = (oy + py + 1) & 0xFF;
-            if (scr_y >= 224) continue;
-            int row = vf ? (oh-1-py) : py;
-            for (int px = 0; px < ow; px++) {
-                int scr_x = ox + px;
-                if (scr_x < 0 || scr_x >= 256) continue;
-                if (layerWindowMasked(4, main_screen, scr_x)) continue;
-                int col = hf ? (ow-1-px) : px;
-                uint16_t t = (uint16_t)tile | (uint16_t)((attr & 0x01) << 8);
-                t = (uint16_t)((t + (row / 8) * 16 + (col / 8)) & 0x01FF);
-                uint32_t ba = name_base;
-                if (t & 0x100) { ba += name_gap; t &= 0xFF; }
-                uint32_t tw = wrapVRAMWordAddress(ba + (uint32_t)t * 16);
-                int fr = row % 8, fc = col % 8;
-                uint32_t bp01 = wrapVRAMWordAddress(tw + fr);
-                uint32_t bp23 = wrapVRAMWordAddress(tw + 8 + fr);
-                int bit = 7 - fc;
-                uint8_t ci = ((vram[bp01*2]>>bit)&1) | (((vram[bp01*2+1]>>bit)&1)<<1)
-                           | (((vram[bp23*2]>>bit)&1)<<2) | (((vram[bp23*2+1]>>bit)&1)<<3);
-                if (ci == 0) continue;
-                size_t pixel = (size_t)scr_y * 256 + scr_x;
-                target[pixel] = colorFromCGRAM(128 + pal*16 + ci);
-                source[pixel] = (pal >= 4) ? 6 : 5;
-            }
+        const int sprite_y = (oy + 1) & 0xFF;
+        int sprite_row = scanline - sprite_y;
+        if (sprite_row < 0) sprite_row += 256;
+        if (sprite_row < 0 || sprite_row >= oh) continue;
+
+        int row = vf ? (oh - 1 - sprite_row) : sprite_row;
+        for (int px = 0; px < ow; px++) {
+            int scr_x = ox + px;
+            if (scr_x < 0 || scr_x >= 256) continue;
+            if (layerWindowMasked(4, main_screen, scr_x)) continue;
+
+            int col = hf ? (ow - 1 - px) : px;
+            uint16_t t = (uint16_t)tile | (uint16_t)((attr & 0x01) << 8);
+            t = (uint16_t)((t + (row / 8) * 16 + (col / 8)) & 0x01FF);
+            uint32_t ba = name_base;
+            if (t & 0x100) { ba += name_gap; t &= 0xFF; }
+            uint32_t tw = wrapVRAMWordAddress(ba + (uint32_t)t * 16);
+            int fr = row % 8, fc = col % 8;
+            uint32_t bp01 = wrapVRAMWordAddress(tw + fr);
+            uint32_t bp23 = wrapVRAMWordAddress(tw + 8 + fr);
+            int bit = 7 - fc;
+            uint8_t ci = ((vram[bp01*2]>>bit)&1) | (((vram[bp01*2+1]>>bit)&1)<<1)
+                       | (((vram[bp23*2]>>bit)&1)<<2) | (((vram[bp23*2+1]>>bit)&1)<<3);
+            if (ci == 0) continue;
+
+            target[scr_x] = colorFromCGRAM(128 + pal*16 + ci);
+            source[scr_x] = (pal >= 4) ? 6 : 5;
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 void PPU::renderFrame() {
-    static constexpr size_t kPixelCount = 256 * 224;
-    vblank_flag = false;
-    if (inidisp & 0x80) { framebuffer.fill(0xFF000000u); vblank_flag = true; return; }
+    beginFrame();
+    if ((inidisp & 0x80) == 0) {
+        for (int scanline = 0; scanline < 224; scanline++) {
+            renderScanline(scanline);
+        }
+    }
+    endFrame();
+}
 
-    uint8_t brightness = inidisp & 0x0F;
+void PPU::renderScanline(int scanline) {
+    if (scanline < 0 || scanline >= 224) return;
+
+    current_hcounter = 0;
+    current_vcounter = (uint16_t)scanline;
+
+    const size_t base = (size_t)scanline * 256;
+    if (inidisp & 0x80) {
+        std::fill_n(framebuffer.data() + base, 256, 0xFF000000u);
+        return;
+    }
+
+    std::array<uint32_t, 256> main_fb;
+    std::array<uint32_t, 256> sub_fb;
+    std::array<uint8_t, 256> main_src;
+    std::array<uint8_t, 256> sub_src;
+
     const uint32_t backdrop = colorFromCGRAM(0);
-    std::array<uint32_t, kPixelCount> main_fb;
-    std::array<uint32_t, kPixelCount> sub_fb;
-    std::array<uint8_t, kPixelCount> main_src;
-    std::array<uint8_t, kPixelCount> sub_src;
+    auto fixed_color_argb = [this]() {
+        uint16_t c15 = fixed_color & 0x7FFF;
+        uint8_t r = (uint8_t)((c15 & 0x001F) << 3); r |= (r >> 5);
+        uint8_t g = (uint8_t)(((c15 >> 5) & 0x1F) << 3); g |= (g >> 5);
+        uint8_t b = (uint8_t)(((c15 >> 10) & 0x1F) << 3); b |= (b >> 5);
+        return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    };
+    const uint32_t fixed_argb = fixed_color_argb();
     main_fb.fill(backdrop);
-    sub_fb.fill(backdrop);
+    sub_fb.fill(fixed_argb);
     main_src.fill(0);
     sub_src.fill(0);
 
-    auto renderScreen = [this](uint8_t layer_mask, bool main_screen, uint32_t* target, uint8_t* source) {
+    auto renderScreen = [this, scanline](uint8_t layer_mask, bool main_screen, uint32_t* target, uint8_t* source) {
         auto drawOBJ = [&](int prio) {
-            if (layer_mask & 0x10) renderSprites(prio, main_screen, target, source);
+            if (layer_mask & 0x10) renderSprites(scanline, prio, main_screen, target, source);
         };
         auto drawBG = [&](int bg_num, int bpp, bool high_priority) {
             if (layer_mask & (1u << bg_num)) {
-                renderBG(bg_num, bpp, high_priority, main_screen, target, source);
+                renderBG(scanline, bg_num, bpp, high_priority, main_screen, target, source);
             }
         };
 
@@ -639,6 +805,13 @@ void PPU::renderFrame() {
             drawBG(0, 4, true);
             drawOBJ(3);
             break;
+        case 7:
+            drawOBJ(0);
+            if (layer_mask & 0x01) renderMode7(scanline, main_screen, target, source);
+            drawOBJ(1);
+            drawOBJ(2);
+            drawOBJ(3);
+            break;
         default:
             break;
         }
@@ -647,19 +820,12 @@ void PPU::renderFrame() {
     renderScreen(tm_main, true, main_fb.data(), main_src.data());
     if (tm_sub) renderScreen(tm_sub, false, sub_fb.data(), sub_src.data());
 
-    auto fixed_color_argb = [this]() {
-        uint16_t c15 = fixed_color & 0x7FFF;
-        uint8_t r = (uint8_t)((c15 & 0x001F) << 3); r |= (r >> 5);
-        uint8_t g = (uint8_t)(((c15 >> 5) & 0x1F) << 3); g |= (g >> 5);
-        uint8_t b = (uint8_t)(((c15 >> 10) & 0x1F) << 3); b |= (b >> 5);
-        return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-    };
-    const uint32_t fixed_argb = fixed_color_argb();
     const bool use_subscreen = (cgwsel & 0x02) != 0;
     const bool subtract = (cgadsub & 0x80) != 0;
     const bool half = (cgadsub & 0x40) != 0;
     const uint8_t main_black_region = (cgwsel >> 6) & 0x03;
-    const uint8_t color_math_region = (cgwsel >> 4) & 0x03;
+    const uint8_t sub_transparent_region = (cgwsel >> 4) & 0x03;
+    const uint8_t brightness = inidisp & 0x0F;
 
     auto colorMathEnabled = [this](uint8_t src) {
         switch (src) {
@@ -686,32 +852,33 @@ void PPU::renderFrame() {
         return 0xFF000000u | ((uint32_t)rr << 16) | ((uint32_t)rg << 8) | (uint32_t)rb;
     };
 
-    for (size_t i = 0; i < kPixelCount; i++) {
-        const int x = (int)(i % 256);
+    for (int x = 0; x < 256; x++) {
         const bool color_window = colorWindowActive(x);
-        uint32_t pixel = main_fb[i];
+        uint32_t pixel = main_fb[x];
         if (colorWindowRegionEnabled(main_black_region, color_window)) {
             pixel = 0xFF000000u;
         }
 
-        bool allow_math = colorMathEnabled(main_src[i]);
-        if (colorWindowRegionEnabled(color_math_region, color_window)) {
-            allow_math = false;
-        }
+        bool allow_math = colorMathEnabled(main_src[x]);
         if (allow_math) {
-            pixel = combine(pixel, use_subscreen ? sub_fb[i] : fixed_argb);
+            uint32_t addend = use_subscreen ? sub_fb[x] : fixed_argb;
+            if (colorWindowRegionEnabled(sub_transparent_region, color_window)) {
+                addend = 0xFF000000u;
+            }
+            pixel = combine(pixel, addend);
         }
-        framebuffer[i] = pixel;
-    }
 
-    if (brightness < 15) {
-        for (auto& pixel : framebuffer) {
-            uint8_t r = (pixel >> 16) & 0xFF, g = (pixel >> 8) & 0xFF, b = pixel & 0xFF;
-            pixel = 0xFF000000u | (((uint32_t)r*brightness/15) << 16)
-                  | (((uint32_t)g*brightness/15) << 8) | ((uint32_t)b*brightness/15);
+        if (brightness < 15) {
+            uint8_t r = (pixel >> 16) & 0xFF;
+            uint8_t g = (pixel >> 8) & 0xFF;
+            uint8_t b = pixel & 0xFF;
+            pixel = 0xFF000000u
+                | (((uint32_t)r * brightness / 15) << 16)
+                | (((uint32_t)g * brightness / 15) << 8)
+                | ((uint32_t)b * brightness / 15);
         }
+        framebuffer[base + x] = pixel;
     }
-    vblank_flag = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

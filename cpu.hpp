@@ -28,6 +28,7 @@ public:
     uint8_t step();
     void printState();
     void nmi();
+    void irq();
 
     // Diagnostic trace — call before loading ROM to enable
     void enableTrace(const std::string& path, uint64_t max_lines = 500000);
@@ -110,6 +111,7 @@ private:
     void DPX();
     void DPY();
     void DP_IND();
+    void DP_LONG();
     void DP_IND_X();
     void DP_IND_Y();
     void DP_IND_Y_LONG();

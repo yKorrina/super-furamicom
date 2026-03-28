@@ -112,6 +112,20 @@ void CPU::nmi() {
     cycles_remaining += 8;
 }
 
+void CPU::irq() {
+    if (halted || getFlag(0x04)) return;
+
+    waiting_for_interrupt = false;
+    push8(PB);
+    push16(PC);
+    push8(P);
+    setFlag(0x04, true);
+    setFlag(0x08, false);
+    PB = 0x00;
+    PC = read16(E ? 0x00FFFE : 0x00FFEE);
+    cycles_remaining += 7;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +188,13 @@ void CPU::DP_IND() {
     uint8_t  ptr = read8(((uint32_t)PB << 16) | PC++);
     uint16_t addr = read16((D + ptr) & 0xFFFF);
     effective_address = ((uint32_t)DB << 16) | addr;
+}
+void CPU::DP_LONG() {
+    uint8_t ptr = read8(((uint32_t)PB << 16) | PC++);
+    uint16_t base = (D + ptr) & 0xFFFF;
+    uint16_t addr = read16(base);
+    uint8_t bank = read8((base + 2) & 0xFFFF);
+    effective_address = ((uint32_t)bank << 16) | addr;
 }
 void CPU::DP_IND_X() {
     uint8_t  ptr = read8(((uint32_t)PB << 16) | PC++);
@@ -619,6 +640,11 @@ void CPU::RTI() {
     P  = pop8();
     PC = pop16();
     if (!E) PB = pop8();
+    if (E) P |= 0x30;
+    if (getFlag(0x10)) {
+        X &= 0x00FF;
+        Y &= 0x00FF;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -643,7 +669,14 @@ void CPU::PLY() {
 
 void CPU::PHK() { push8(PB); }
 void CPU::PHP() { push8(P); }
-void CPU::PLP() { P = pop8(); if (E) P |= 0x30; }
+void CPU::PLP() {
+    P = pop8();
+    if (E) P |= 0x30;
+    if (getFlag(0x10)) {
+        X &= 0x00FF;
+        Y &= 0x00FF;
+    }
+}
 void CPU::PHB() { push8(DB); }
 void CPU::PLB() { DB = pop8(); setFlag(0x02, DB==0); setFlag(0x80, (DB&0x80)!=0); }
 void CPU::PHD() { push16(D); }
@@ -717,8 +750,22 @@ void CPU::CLV() { setFlag(0x40, false); }
 void CPU::SED() { setFlag(0x08, true); }
 void CPU::CLD() { setFlag(0x08, false); }
 
-void CPU::REP() { P &= ~read8(effective_address); if (E) P |= 0x30; }
-void CPU::SEP() { P |=  read8(effective_address); if (E) P |= 0x30; }
+void CPU::REP() {
+    P &= ~read8(effective_address);
+    if (E) P |= 0x30;
+    if (getFlag(0x10)) {
+        X &= 0x00FF;
+        Y &= 0x00FF;
+    }
+}
+void CPU::SEP() {
+    P |= read8(effective_address);
+    if (E) P |= 0x30;
+    if (getFlag(0x10)) {
+        X &= 0x00FF;
+        Y &= 0x00FF;
+    }
+}
 
 void CPU::XCE() {
     bool oldCarry = getFlag(0x01);
@@ -727,7 +774,12 @@ void CPU::XCE() {
     if (E) {
         setFlag(0x20, true);
         setFlag(0x10, true);
+        X &= 0x00FF;
+        Y &= 0x00FF;
         SP = 0x0100 | (SP & 0xFF);
+    } else if (getFlag(0x10)) {
+        X &= 0x00FF;
+        Y &= 0x00FF;
     }
 }
 
@@ -813,7 +865,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0x01] = { &CPU::ORA,  &CPU::DP_IND_X,      6, "ORA" };
     instruction_table[0x03] = { &CPU::ORA,  &CPU::SR,             4, "ORA" };
     instruction_table[0x05] = { &CPU::ORA,  &CPU::DP,             3, "ORA" };
-    instruction_table[0x07] = { &CPU::ORA,  &CPU::DP_IND_Y_LONG, 6, "ORA" };
+    instruction_table[0x07] = { &CPU::ORA,  &CPU::DP_LONG,       6, "ORA" };
     instruction_table[0x09] = { &CPU::ORA,  &CPU::IMM_M,          2, "ORA" };
     instruction_table[0x0D] = { &CPU::ORA,  &CPU::ABS,            4, "ORA" };
     instruction_table[0x0F] = { &CPU::ORA,  &CPU::AL,             5, "ORA" };
@@ -830,7 +882,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0x21] = { &CPU::AND,  &CPU::DP_IND_X,      6, "AND" };
     instruction_table[0x23] = { &CPU::AND,  &CPU::SR,             4, "AND" };
     instruction_table[0x25] = { &CPU::AND,  &CPU::DP,             3, "AND" };
-    instruction_table[0x27] = { &CPU::AND,  &CPU::DP_IND_Y_LONG, 6, "AND" };
+    instruction_table[0x27] = { &CPU::AND,  &CPU::DP_LONG,       6, "AND" };
     instruction_table[0x29] = { &CPU::AND,  &CPU::IMM_M,          2, "AND" };
     instruction_table[0x2D] = { &CPU::AND,  &CPU::ABS,            4, "AND" };
     instruction_table[0x2F] = { &CPU::AND,  &CPU::AL,             5, "AND" };
@@ -847,7 +899,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0x41] = { &CPU::EOR,  &CPU::DP_IND_X,      6, "EOR" };
     instruction_table[0x43] = { &CPU::EOR,  &CPU::SR,             4, "EOR" };
     instruction_table[0x45] = { &CPU::EOR,  &CPU::DP,             3, "EOR" };
-    instruction_table[0x47] = { &CPU::EOR,  &CPU::DP_IND_Y_LONG, 6, "EOR" };
+    instruction_table[0x47] = { &CPU::EOR,  &CPU::DP_LONG,       6, "EOR" };
     instruction_table[0x49] = { &CPU::EOR,  &CPU::IMM_M,          2, "EOR" };
     instruction_table[0x4D] = { &CPU::EOR,  &CPU::ABS,            4, "EOR" };
     instruction_table[0x4F] = { &CPU::EOR,  &CPU::AL,             5, "EOR" };
@@ -864,7 +916,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0x61] = { &CPU::ADC,  &CPU::DP_IND_X,      6, "ADC" };
     instruction_table[0x63] = { &CPU::ADC,  &CPU::SR,             4, "ADC" };
     instruction_table[0x65] = { &CPU::ADC,  &CPU::DP,             3, "ADC" };
-    instruction_table[0x67] = { &CPU::ADC,  &CPU::DP_IND_Y_LONG, 6, "ADC" };
+    instruction_table[0x67] = { &CPU::ADC,  &CPU::DP_LONG,       6, "ADC" };
     instruction_table[0x69] = { &CPU::ADC,  &CPU::IMM_M,          2, "ADC" };
     instruction_table[0x6D] = { &CPU::ADC,  &CPU::ABS,            4, "ADC" };
     instruction_table[0x6F] = { &CPU::ADC,  &CPU::AL,             5, "ADC" };
@@ -881,7 +933,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0x81] = { &CPU::STA,  &CPU::DP_IND_X,      6, "STA" };
     instruction_table[0x83] = { &CPU::STA,  &CPU::SR,             4, "STA" };
     instruction_table[0x85] = { &CPU::STA,  &CPU::DP,             3, "STA" };
-    instruction_table[0x87] = { &CPU::STA,  &CPU::DP_IND_Y_LONG, 6, "STA" };
+    instruction_table[0x87] = { &CPU::STA,  &CPU::DP_LONG,       6, "STA" };
     instruction_table[0x8D] = { &CPU::STA,  &CPU::ABS,            4, "STA" };
     instruction_table[0x8F] = { &CPU::STA,  &CPU::AL,             5, "STA" };
     instruction_table[0x91] = { &CPU::STA,  &CPU::DP_IND_Y,       6, "STA" };
@@ -897,7 +949,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0xA1] = { &CPU::LDA,  &CPU::DP_IND_X,      6, "LDA" };
     instruction_table[0xA3] = { &CPU::LDA,  &CPU::SR,             4, "LDA" };
     instruction_table[0xA5] = { &CPU::LDA,  &CPU::DP,             3, "LDA" };
-    instruction_table[0xA7] = { &CPU::LDA,  &CPU::DP_IND_Y_LONG, 6, "LDA" };
+    instruction_table[0xA7] = { &CPU::LDA,  &CPU::DP_LONG,       6, "LDA" };
     instruction_table[0xA9] = { &CPU::LDA,  &CPU::IMM_M,          2, "LDA" };
     instruction_table[0xAD] = { &CPU::LDA,  &CPU::ABS,            4, "LDA" };
     instruction_table[0xAF] = { &CPU::LDA,  &CPU::AL,             5, "LDA" };
@@ -914,7 +966,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0xC1] = { &CPU::CMP,  &CPU::DP_IND_X,      6, "CMP" };
     instruction_table[0xC3] = { &CPU::CMP,  &CPU::SR,             4, "CMP" };
     instruction_table[0xC5] = { &CPU::CMP,  &CPU::DP,             3, "CMP" };
-    instruction_table[0xC7] = { &CPU::CMP,  &CPU::DP_IND_Y_LONG, 6, "CMP" };
+    instruction_table[0xC7] = { &CPU::CMP,  &CPU::DP_LONG,       6, "CMP" };
     instruction_table[0xC9] = { &CPU::CMP,  &CPU::IMM_M,          2, "CMP" };
     instruction_table[0xCD] = { &CPU::CMP,  &CPU::ABS,            4, "CMP" };
     instruction_table[0xCF] = { &CPU::CMP,  &CPU::AL,             5, "CMP" };
@@ -931,7 +983,7 @@ void CPU::buildInstructionTable() {
     instruction_table[0xE1] = { &CPU::SBC,  &CPU::DP_IND_X,      6, "SBC" };
     instruction_table[0xE3] = { &CPU::SBC,  &CPU::SR,             4, "SBC" };
     instruction_table[0xE5] = { &CPU::SBC,  &CPU::DP,             3, "SBC" };
-    instruction_table[0xE7] = { &CPU::SBC,  &CPU::DP_IND_Y_LONG, 6, "SBC" };
+    instruction_table[0xE7] = { &CPU::SBC,  &CPU::DP_LONG,       6, "SBC" };
     instruction_table[0xE9] = { &CPU::SBC,  &CPU::IMM_M,          2, "SBC" };
     instruction_table[0xED] = { &CPU::SBC,  &CPU::ABS,            4, "SBC" };
     instruction_table[0xEF] = { &CPU::SBC,  &CPU::AL,             5, "SBC" };

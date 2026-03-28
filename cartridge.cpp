@@ -85,9 +85,11 @@ uint8_t Cartridge::read(uint32_t address) {
 
     if (!is_hirom) {
         // ── LoROM ────────────────────────────────────────────────────────
-        // SRAM: banks $70-$7D at $0000-$7FFF
-        if (bank >= 0x70 && bank <= 0x7D && offset < 0x8000) {
-            uint32_t sram_addr = ((bank - 0x70) * 0x8000 + offset) % sram.size();
+        // SRAM: banks $70-$7D and $F0-$FF at $0000-$7FFF
+        if (((bank >= 0x70 && bank <= 0x7D) || bank >= 0xF0) && offset < 0x8000) {
+            const uint32_t bank_index = bank >= 0xF0 ? (uint32_t)(bank - 0xF0)
+                                                     : (uint32_t)(bank - 0x70);
+            uint32_t sram_addr = (bank_index * 0x8000 + offset) % sram.size();
             return sram.empty() ? 0x00 : sram[sram_addr];
         }
         // SRAM mirror: banks $00-$3F at $6000-$7FFF (some games use this)
@@ -146,8 +148,10 @@ void Cartridge::write(uint32_t address, uint8_t data) {
 
     if (!is_hirom) {
         // LoROM SRAM
-        if (bank >= 0x70 && bank <= 0x7D && offset < 0x8000) {
-            uint32_t sram_addr = ((bank - 0x70) * 0x8000 + offset) % sram.size();
+        if (((bank >= 0x70 && bank <= 0x7D) || bank >= 0xF0) && offset < 0x8000) {
+            const uint32_t bank_index = bank >= 0xF0 ? (uint32_t)(bank - 0xF0)
+                                                     : (uint32_t)(bank - 0x70);
+            uint32_t sram_addr = (bank_index * 0x8000 + offset) % sram.size();
             sram[sram_addr] = data;
             return;
         }
