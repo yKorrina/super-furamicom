@@ -39,6 +39,19 @@ public:
     bool consumeNMI();
     bool consumeIRQ();
     void setJoypadState(uint16_t pad1, uint16_t pad2);
+    uint16_t getJoy1AutoRead() const { return joy1_auto_read; }
+    uint16_t getJoy2AutoRead() const { return joy2_auto_read; }
+    uint16_t getJoy1Shift() const { return joy1_shift; }
+    uint16_t getJoy2Shift() const { return joy2_shift; }
+    bool getJoypadStrobe() const { return joypad_strobe; }
+    uint8_t getLastJoy4016Write() const { return last_joy4016_write; }
+    std::uint64_t getJoy4016Reads() const { return joy4016_reads; }
+    std::uint64_t getJoy4017Reads() const { return joy4017_reads; }
+    std::uint64_t getJoy4218Reads() const { return joy4218_reads; }
+    std::uint64_t getJoy4219Reads() const { return joy4219_reads; }
+    std::uint64_t getJoy421AReads() const { return joy421A_reads; }
+    std::uint64_t getJoy421BReads() const { return joy421B_reads; }
+    std::uint64_t getJoy4016Writes() const { return joy4016_writes; }
 
     // Save SRAM to disk
     void saveSRAM();
@@ -55,6 +68,9 @@ private:
     void initializeHDMAChannel(int channel);
     void reloadHDMALineCounter(int channel);
     void transferHDMAChannel(int channel);
+    void latchJoypads();
+    static uint16_t encodeJoypadState(uint16_t state);
+    uint8_t readJoypadSerial(int port);
     
     bool nmi_enabled; 
     uint8_t hdma_enable = 0;
@@ -70,6 +86,19 @@ private:
 
     uint16_t joy1_state = 0;
     uint16_t joy2_state = 0;
+    uint16_t joy1_auto_read = 0;
+    uint16_t joy2_auto_read = 0;
+    uint16_t joy1_shift = 0;
+    uint16_t joy2_shift = 0;
+    bool joypad_strobe = false;
+    uint8_t last_joy4016_write = 0;
+    std::uint64_t joy4016_reads = 0;
+    std::uint64_t joy4017_reads = 0;
+    std::uint64_t joy4218_reads = 0;
+    std::uint64_t joy4219_reads = 0;
+    std::uint64_t joy421A_reads = 0;
+    std::uint64_t joy421B_reads = 0;
+    std::uint64_t joy4016_writes = 0;
 
     uint8_t  wrmpya = 0;
     uint16_t wrdivl = 0;

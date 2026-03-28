@@ -9,7 +9,8 @@ namespace {
 constexpr int kCpuCyclesPerSecond = 29781 * 60;
 constexpr int kSpcCyclesPerSecond = 1024000;
 constexpr int kSpcCyclesPerSample = 32;
-constexpr std::size_t kMaxQueuedSamples = APU::kOutputHz * 2 * 2;
+constexpr std::size_t kMaxQueuedFrames = 2048;
+constexpr std::size_t kMaxQueuedSamples = kMaxQueuedFrames * 2;
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::array<int, 32> kCounterRates = {
     0, 2048, 1536, 1280, 1024, 768, 640, 512,
@@ -96,11 +97,16 @@ std::array<APU::VoiceDebug, 8> APU::getVoiceDebug() const {
         out.pitch_mod_enabled = voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0;
         out.source_number = voice.source_number;
         out.adsr1 = dsp_regs[base + 5];
+        out.max_adsr1_written = max_voice_adsr1_written[voice_index];
         out.adsr2 = dsp_regs[base + 6];
         out.gain = dsp_regs[base + 7];
         out.source_start = voice.source_start;
         out.loop_start = voice.loop_start;
         out.next_block_addr = voice.next_block_addr;
+        out.interp_index = voice.interp_index;
+        out.sample_index = voice.sample_index;
+        out.decoded_sample_count = (int)voice.decoded_samples.size();
+        out.current_sample = voice.current_sample;
         out.pitch = (uint16_t)dsp_regs[base + 2] | ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8);
         out.envelope = voice.envelope;
         out.last_output = voice.last_output;
@@ -125,19 +131,28 @@ std::array<APU::TimerDebug, 3> APU::getTimerDebug() const {
     return info;
 }
 
+std::size_t APU::getQueuedAudioFrames() const {
+    std::lock_guard<std::mutex> lock(audio_mutex);
+    return audio_count / 2;
+}
+
 void APU::reset() {
     ram.fill(0);
     cpu_to_spc.fill(0);
     spc_to_cpu.fill(0);
     dsp_regs.fill(0);
     dsp_write_counts.fill(0);
+    max_voice_adsr1_written.fill(0);
     voices.fill(Voice{});
     recent_audio_mono.fill(0);
     echo_history_left.fill(0);
     echo_history_right.fill(0);
     {
         std::lock_guard<std::mutex> lock(audio_mutex);
-        audio_fifo.clear();
+        audio_fifo.fill(0);
+        audio_read_pos = 0;
+        audio_write_pos = 0;
+        audio_count = 0;
     }
 
     timers[0] = Timer{};
@@ -173,12 +188,14 @@ void APU::reset() {
     audio_peak_sample = 0;
     cpu_cycle_accumulator = 0;
     dsp_sample_counter = 0;
+    dsp_key_poll_phase = false;
     sample_cycle_accumulator = 0;
     spc_cycle_budget = 0;
     recent_audio_pos = 0;
     recent_audio_filled = false;
     echo_history_pos = 0;
     noise_lfsr = 0x4000;
+    pending_kon = 0;
     key_on_count = 0;
     key_off_count = 0;
     last_key_on_mask = 0;
@@ -225,9 +242,10 @@ void APU::mix(int16_t* stream, int stereo_frames) {
     std::lock_guard<std::mutex> lock(audio_mutex);
     const int sample_count = stereo_frames * 2;
     for (int i = 0; i < sample_count; i++) {
-        if (!audio_fifo.empty()) {
-            stream[i] = audio_fifo.front();
-            audio_fifo.pop_front();
+        if (audio_count != 0) {
+            stream[i] = audio_fifo[audio_read_pos];
+            audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
+            audio_count--;
         } else {
             stream[i] = 0;
         }
@@ -266,8 +284,8 @@ uint8_t APU::readMem(uint16_t address) {
     }
 
     switch (address) {
-    case 0x00F0: return ram[address];
-    case 0x00F1: return ram[address];
+    case 0x00F0: return 0x00;
+    case 0x00F1: return 0x00;
     case 0x00F2: return dsp_addr;
     case 0x00F3: return dsp_regs[dsp_addr & 0x7F];
     case 0x00F4:
@@ -278,7 +296,7 @@ uint8_t APU::readMem(uint16_t address) {
     case 0x00FA:
     case 0x00FB:
     case 0x00FC:
-        return ram[address];
+        return 0x00;
     case 0x00FD:
     case 0x00FE:
     case 0x00FF: {
@@ -308,12 +326,23 @@ void APU::writeDSP(uint8_t reg, uint8_t value) {
         return;
     }
     dsp_regs[reg] = value;
+    if ((reg & 0x0F) == 0x05) {
+        max_voice_adsr1_written[(reg >> 4) & 0x07] =
+            std::max(max_voice_adsr1_written[(reg >> 4) & 0x07], value);
+    }
     switch (reg) {
     case 0x4C:
-        keyOn(value);
+        if (value != 0) {
+            key_on_count++;
+            last_key_on_mask = value;
+            pending_kon |= value;
+        }
         break;
     case 0x5C:
-        keyOff(value);
+        if (value != 0) {
+            key_off_count++;
+            last_key_off_mask = value;
+        }
         break;
     case 0x6C:
         if (value & 0x80) {
@@ -471,11 +500,16 @@ void APU::queueSample(int16_t left, int16_t right) {
     }
 
     std::lock_guard<std::mutex> lock(audio_mutex);
-    while (audio_fifo.size() > kMaxQueuedSamples) {
-        audio_fifo.pop_front();
+    while (audio_count + 2 > kMaxQueuedSamples) {
+        audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
+        audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
+        audio_count -= 2;
     }
-    audio_fifo.push_back(left);
-    audio_fifo.push_back(right);
+    audio_fifo[audio_write_pos] = left;
+    audio_write_pos = (audio_write_pos + 1) % audio_fifo.size();
+    audio_fifo[audio_write_pos] = right;
+    audio_write_pos = (audio_write_pos + 1) % audio_fifo.size();
+    audio_count += 2;
 }
 
 bool APU::shouldTickRate(uint8_t rate) const {
@@ -491,8 +525,8 @@ void APU::updateNoise() {
     if (!shouldTickRate(dsp_regs[0x6C] & 0x1F)) return;
 
     const uint16_t lfsr = (uint16_t)noise_lfsr & 0x7FFF;
-    const uint16_t feedback = ((lfsr >> 14) ^ (lfsr >> 13)) & 0x01;
-    uint16_t next = (uint16_t)(((lfsr << 1) & 0x7FFE) | feedback);
+    const uint16_t feedback = (uint16_t)(((lfsr << 14) ^ (lfsr << 13)) & 0x4000);
+    uint16_t next = (uint16_t)((lfsr >> 1) | feedback);
     if (next == 0) next = 0x4000;
     noise_lfsr = signExtend15(next);
 }
@@ -599,10 +633,6 @@ void APU::updateEnvelope(int voice_index) {
 }
 
 void APU::keyOn(uint8_t voice_mask) {
-    if (voice_mask != 0) {
-        key_on_count++;
-        last_key_on_mask = voice_mask;
-    }
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
             Voice& voice = voices[voice_index];
@@ -620,16 +650,24 @@ void APU::keyOn(uint8_t voice_mask) {
 }
 
 void APU::keyOff(uint8_t voice_mask) {
-    if (voice_mask != 0) {
-        key_off_count++;
-        last_key_off_mask = voice_mask;
-    }
     for (int voice_index = 0; voice_index < 8; voice_index++) {
         if ((voice_mask & (1u << voice_index)) != 0) {
-            if (voices[voice_index].key_on_pending) continue;
             voices[voice_index].envelope_mode = EnvelopeMode::Release;
             voices[voice_index].releasing = true;
         }
+    }
+}
+
+void APU::pollKeyStates() {
+    const uint8_t koff = dsp_regs[0x5C];
+    const uint8_t kon = pending_kon;
+
+    if (koff != 0) {
+        keyOff(koff);
+    }
+    if (kon != 0) {
+        keyOn(kon);
+        pending_kon = 0;
     }
 }
 
@@ -768,11 +806,67 @@ int16_t APU::renderVoice(int voice_index) {
         }
     }
 
+    while (voice.active &&
+           !voice.stop_after_block &&
+           voice.sample_index >= (int)voice.decoded_samples.size()) {
+        if (!decodeNextBlock(voice_index)) {
+            voice.active = false;
+            dsp_regs[base + 8] = 0;
+            dsp_regs[base + 9] = 0;
+            return 0;
+        }
+    }
+
+    if (voice.sample_index >= (int)voice.decoded_samples.size()) {
+        voice.active = false;
+        voice.releasing = true;
+        voice.envelope = 0;
+        dsp_regs[base + 8] = 0;
+        dsp_regs[base + 9] = 0;
+        return 0;
+    }
+
+    auto sampleAt = [&voice](int index) {
+        index = clampIndex(index, 0, (int)voice.decoded_samples.size() - 1);
+        return voice.decoded_samples[(std::size_t)index];
+    };
+
+    const auto& gaussian = GaussianTable();
+    const int offset = (voice.interp_index >> 4) & 0xFF;
+    const int s0 = sampleAt(voice.sample_index - 3);
+    const int s1 = sampleAt(voice.sample_index - 2);
+    const int s2 = sampleAt(voice.sample_index - 1);
+    const int s3 = sampleAt(voice.sample_index + 0);
+
+    int interpolated = 0;
+    interpolated += (gaussian[0x0FF - offset] * s0) >> 11;
+    interpolated += (gaussian[0x1FF - offset] * s1) >> 11;
+    interpolated += (gaussian[0x100 + offset] * s2) >> 11;
+    interpolated += (gaussian[0x000 + offset] * s3) >> 11;
+
     const bool noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
-    int sample = 0;
-    if (noise_enabled) {
-        sample = (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF);
-    } else {
+    int sample = noise_enabled ? (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF)
+                               : (clamp16(interpolated) & ~1);
+    voice.current_sample = (int16_t)sample;
+    const int voice_output = clamp16((sample * (int)voice.envelope) >> 11);
+    voice.last_output = (int16_t)voice_output;
+
+    dsp_regs[base + 8] = (uint8_t)std::min(0xFF, (int)(voice.envelope >> 4));
+    dsp_regs[base + 9] = (uint8_t)(voice_output >> 8);
+
+    int pitch = (int)((uint16_t)dsp_regs[base + 2] |
+                      ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8));
+    if (voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0) {
+        const int prev_outx = (int8_t)dsp_regs[((voice_index - 1) << 4) + 9];
+        pitch += (((prev_outx >> 5) * pitch) >> 10);
+    }
+    pitch = std::clamp(pitch, 0, 0x3FFF);
+
+    voice.interp_index = (uint16_t)(voice.interp_index + pitch);
+    while (voice.interp_index >= 0x1000 && voice.active) {
+        voice.interp_index -= 0x1000;
+        voice.sample_index++;
+
         while (voice.active &&
                !voice.stop_after_block &&
                voice.sample_index >= (int)voice.decoded_samples.size()) {
@@ -784,7 +878,8 @@ int16_t APU::renderVoice(int voice_index) {
             }
         }
 
-        if (voice.sample_index >= (int)voice.decoded_samples.size()) {
+        if (voice.stop_after_block &&
+            voice.sample_index >= (int)voice.decoded_samples.size()) {
             voice.active = false;
             voice.releasing = true;
             voice.envelope = 0;
@@ -793,72 +888,11 @@ int16_t APU::renderVoice(int voice_index) {
             return 0;
         }
 
-        auto sampleAt = [&voice](int index) {
-            index = clampIndex(index, 0, (int)voice.decoded_samples.size() - 1);
-            return voice.decoded_samples[(std::size_t)index];
-        };
-
-        const auto& gaussian = GaussianTable();
-        const int offset = (voice.interp_index >> 4) & 0xFF;
-        const int s0 = sampleAt(voice.sample_index - 3);
-        const int s1 = sampleAt(voice.sample_index - 2);
-        const int s2 = sampleAt(voice.sample_index - 1);
-        const int s3 = sampleAt(voice.sample_index + 0);
-
-        int interpolated = 0;
-        interpolated += (gaussian[0x0FF - offset] * s0) >> 11;
-        interpolated += (gaussian[0x1FF - offset] * s1) >> 11;
-        interpolated += (gaussian[0x100 + offset] * s2) >> 11;
-        interpolated += (gaussian[0x000 + offset] * s3) >> 11;
-        sample = clamp16(interpolated) & ~1;
-    }
-    const int voice_output = clamp16((sample * (int)voice.envelope) >> 11);
-    voice.last_output = (int16_t)voice_output;
-
-    dsp_regs[base + 8] = (uint8_t)std::min(0xFF, (int)(voice.envelope >> 4));
-    dsp_regs[base + 9] = (uint8_t)(voice_output >> 8);
-
-    if (!noise_enabled) {
-        int pitch = (int)((uint16_t)dsp_regs[base + 2] |
-                          ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8));
-        if (voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0) {
-            const int8_t mod = (int8_t)dsp_regs[((voice_index - 1) << 4) + 9];
-            pitch += (pitch * mod) >> 7;
-        }
-        pitch = std::clamp(pitch, 0, 0x3FFF);
-
-        voice.interp_index = (uint16_t)(voice.interp_index + pitch);
-        while (voice.interp_index >= 0x1000 && voice.active) {
-            voice.interp_index -= 0x1000;
-            voice.sample_index++;
-
-            while (voice.active &&
-                   !voice.stop_after_block &&
-                   voice.sample_index >= (int)voice.decoded_samples.size()) {
-                if (!decodeNextBlock(voice_index)) {
-                    voice.active = false;
-                    dsp_regs[base + 8] = 0;
-                    dsp_regs[base + 9] = 0;
-                    return 0;
-                }
-            }
-
-            if (voice.stop_after_block &&
-                voice.sample_index >= (int)voice.decoded_samples.size()) {
-                voice.active = false;
-                voice.releasing = true;
-                voice.envelope = 0;
-                dsp_regs[base + 8] = 0;
-                dsp_regs[base + 9] = 0;
-                return 0;
-            }
-
-            if (voice.sample_index > 24) {
-                const int trim = voice.sample_index - 24;
-                voice.decoded_samples.erase(voice.decoded_samples.begin(),
-                                            voice.decoded_samples.begin() + trim);
-                voice.sample_index -= trim;
-            }
+        if (voice.sample_index > 24) {
+            const int trim = voice.sample_index - 24;
+            voice.decoded_samples.erase(voice.decoded_samples.begin(),
+                                        voice.decoded_samples.begin() + trim);
+            voice.sample_index -= trim;
         }
     }
 
@@ -882,6 +916,10 @@ void APU::synthesizeSamples(int spc_cycles) {
         sample_cycle_accumulator -= kSpcCyclesPerSample;
         dsp_sample_counter++;
         updateNoise();
+        dsp_key_poll_phase = !dsp_key_poll_phase;
+        if (!dsp_key_poll_phase) {
+            pollKeyStates();
+        }
 
         int mixed_left = 0;
         int mixed_right = 0;
@@ -945,7 +983,6 @@ void APU::synthesizeSamples(int spc_cycles) {
         }
 
         echo_history_pos = (echo_history_pos + 1) & 7;
-        dsp_regs[0x4C] = 0;
         queueSample((int16_t)mixed_left, (int16_t)mixed_right);
     }
 }
@@ -1056,6 +1093,12 @@ int APU::stepInstruction() {
         return value;
     };
 
+    auto decodeBitAddress = [this](uint16_t& addr, uint8_t& bit) {
+        const uint16_t operand = fetchWord();
+        addr = (uint16_t)(operand & 0x1FFF);
+        bit = (uint8_t)(operand >> 13);
+    };
+
     switch (opcode) {
     case 0x00:
         return 2;
@@ -1155,13 +1198,21 @@ int APU::stepInstruction() {
         setNZ8(a);
         return 2;
     case 0x09: {
-        uint8_t dst_direct = fetchByte();
         uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
         uint16_t dst_addr = directPageAddress(dst_direct);
         uint8_t value = (uint8_t)(readMem(dst_addr) | readMem(directPageAddress(src_direct)));
         writeMem(dst_addr, value);
         setNZ8(value);
         return 6;
+    }
+    case 0x0A: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        const bool bit_set = (readMem(addr) & (uint8_t)(1u << bit)) != 0;
+        setFlag(kFlagC, getFlag(kFlagC) || bit_set);
+        return 5;
     }
     case 0x0B: {
         uint8_t direct = fetchByte();
@@ -1220,6 +1271,14 @@ int APU::stepInstruction() {
         uint16_t addr = directPageAddress(direct);
         uint8_t value = (uint8_t)(readMem(addr) | imm);
         writeMem(addr, value);
+        setNZ8(value);
+        return 5;
+    }
+    case 0x19: {
+        uint16_t x_addr = directPageAddress(x);
+        uint16_t y_addr = directPageAddress(y);
+        uint8_t value = (uint8_t)(readMem(x_addr) | readMem(y_addr));
+        writeMem(x_addr, value);
         setNZ8(value);
         return 5;
     }
@@ -1287,6 +1346,23 @@ int APU::stepInstruction() {
         a &= fetchByte();
         setNZ8(a);
         return 2;
+    case 0x29: {
+        uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
+        uint16_t dst_addr = directPageAddress(dst_direct);
+        uint8_t value = (uint8_t)(readMem(dst_addr) & readMem(directPageAddress(src_direct)));
+        writeMem(dst_addr, value);
+        setNZ8(value);
+        return 6;
+    }
+    case 0x2A: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        const bool bit_clear = (readMem(addr) & (uint8_t)(1u << bit)) == 0;
+        setFlag(kFlagC, getFlag(kFlagC) || bit_clear);
+        return 5;
+    }
     case 0x2D:
         push(a);
         return 4;
@@ -1341,6 +1417,14 @@ int APU::stepInstruction() {
         uint16_t addr = directPageAddress(direct);
         uint8_t value = (uint8_t)(readMem(addr) & imm);
         writeMem(addr, value);
+        setNZ8(value);
+        return 5;
+    }
+    case 0x39: {
+        uint16_t x_addr = directPageAddress(x);
+        uint16_t y_addr = directPageAddress(y);
+        uint8_t value = (uint8_t)(readMem(x_addr) & readMem(y_addr));
+        writeMem(x_addr, value);
         setNZ8(value);
         return 5;
     }
@@ -1404,13 +1488,21 @@ int APU::stepInstruction() {
         setNZ8(a);
         return 2;
     case 0x49: {
-        uint8_t dst_direct = fetchByte();
         uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
         uint16_t dst_addr = directPageAddress(dst_direct);
         uint8_t value = (uint8_t)(readMem(dst_addr) ^ readMem(directPageAddress(src_direct)));
         writeMem(dst_addr, value);
         setNZ8(value);
         return 6;
+    }
+    case 0x4A: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        const bool bit_set = (readMem(addr) & (uint8_t)(1u << bit)) != 0;
+        setFlag(kFlagC, getFlag(kFlagC) && bit_set);
+        return 4;
     }
     case 0x4D:
         push(x);
@@ -1469,6 +1561,14 @@ int APU::stepInstruction() {
         setNZ8(value);
         return 5;
     }
+    case 0x59: {
+        uint16_t x_addr = directPageAddress(x);
+        uint16_t y_addr = directPageAddress(y);
+        uint8_t value = (uint8_t)(readMem(x_addr) ^ readMem(y_addr));
+        writeMem(x_addr, value);
+        setNZ8(value);
+        return 5;
+    }
     case 0x5D:
         x = a;
         setNZ8(x);
@@ -1524,12 +1624,20 @@ int APU::stepInstruction() {
         cmp8(a, fetchByte());
         return 2;
     case 0x69: {
-        uint8_t dst_direct = fetchByte();
         uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
         uint8_t lhs = readMem(directPageAddress(dst_direct));
         uint8_t rhs = readMem(directPageAddress(src_direct));
         cmp8(lhs, rhs);
         return 6;
+    }
+    case 0x6A: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        const bool bit_clear = (readMem(addr) & (uint8_t)(1u << bit)) == 0;
+        setFlag(kFlagC, getFlag(kFlagC) && bit_clear);
+        return 4;
     }
     case 0x6D:
         push(y);
@@ -1585,14 +1693,21 @@ int APU::stepInstruction() {
         cmp8(value, imm);
         return 5;
     }
+    case 0x79: {
+        const uint8_t lhs = readMem(directPageAddress(x));
+        const uint8_t rhs = readMem(directPageAddress(y));
+        cmp8(lhs, rhs);
+        return 5;
+    }
     case 0x7A: {
         uint8_t direct = fetchByte();
         uint16_t lhs = (uint16_t)a | ((uint16_t)y << 8);
         uint16_t rhs = readDirectWord(direct);
-        uint32_t result = (uint32_t)lhs + rhs;
+        const uint32_t carry_in = getFlag(kFlagC) ? 1u : 0u;
+        uint32_t result = (uint32_t)lhs + rhs + carry_in;
         uint16_t out = (uint16_t)result;
         setFlag(kFlagC, result > 0xFFFF);
-        setFlag(kFlagH, ((lhs & 0x0FFF) + (rhs & 0x0FFF)) > 0x0FFF);
+        setFlag(kFlagH, ((lhs & 0x0FFF) + (rhs & 0x0FFF) + carry_in) > 0x0FFF);
         setFlag(kFlagV, (~(lhs ^ rhs) & (lhs ^ out) & 0x8000) != 0);
         a = out & 0xFF;
         y = out >> 8;
@@ -1643,6 +1758,21 @@ int APU::stepInstruction() {
     case 0x88:
         adc(fetchByte());
         return 2;
+    case 0x89: {
+        uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
+        uint16_t dst_addr = directPageAddress(dst_direct);
+        writeMem(dst_addr, adc8(readMem(dst_addr), readMem(directPageAddress(src_direct))));
+        return 6;
+    }
+    case 0x8A: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        const bool bit_set = (readMem(addr) & (uint8_t)(1u << bit)) != 0;
+        setFlag(kFlagC, getFlag(kFlagC) != bit_set);
+        return 5;
+    }
     case 0x8B: {
         uint8_t direct = fetchByte();
         uint16_t addr = directPageAddress(direct);
@@ -1702,10 +1832,11 @@ int APU::stepInstruction() {
         uint8_t direct = fetchByte();
         uint16_t lhs = (uint16_t)a | ((uint16_t)y << 8);
         uint16_t rhs = readDirectWord(direct);
-        int result = (int)lhs - rhs;
+        const int borrow = getFlag(kFlagC) ? 0 : 1;
+        int result = (int)lhs - rhs - borrow;
         uint16_t out = (uint16_t)result;
         setFlag(kFlagC, result >= 0);
-        setFlag(kFlagH, ((int)(lhs & 0x0FFF) - (int)(rhs & 0x0FFF)) >= 0);
+        setFlag(kFlagH, ((int)(lhs & 0x0FFF) - (int)(rhs & 0x0FFF) - borrow) >= 0);
         setFlag(kFlagV, ((lhs ^ rhs) & (lhs ^ out) & 0x8000) != 0);
         a = out & 0xFF;
         y = out >> 8;
@@ -1770,9 +1901,23 @@ int APU::stepInstruction() {
     case 0xA8:
         sbc(fetchByte());
         return 2;
+    case 0xA9: {
+        uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
+        uint16_t dst_addr = directPageAddress(dst_direct);
+        writeMem(dst_addr, sbc8(readMem(dst_addr), readMem(directPageAddress(src_direct))));
+        return 6;
+    }
     case 0xA0:
         setFlag(kFlagI, true);
         return 3;
+    case 0xAA: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        setFlag(kFlagC, (readMem(addr) & (uint8_t)(1u << bit)) != 0);
+        return 4;
+    }
     case 0xAB: {
         uint8_t direct = fetchByte();
         uint8_t value = (uint8_t)(readMem(directPageAddress(direct)) + 1);
@@ -1812,6 +1957,19 @@ int APU::stepInstruction() {
     case 0xB7:
         sbc(readMem(indirectIndexedY(fetchByte())));
         return 6;
+    case 0xB8: {
+        uint8_t imm = fetchByte();
+        uint8_t direct = fetchByte();
+        uint16_t addr = directPageAddress(direct);
+        writeMem(addr, sbc8(readMem(addr), imm));
+        return 5;
+    }
+    case 0xB9: {
+        uint16_t x_addr = directPageAddress(x);
+        uint16_t y_addr = directPageAddress(y);
+        writeMem(x_addr, sbc8(readMem(x_addr), readMem(y_addr)));
+        return 5;
+    }
     case 0xBA: {
         uint8_t direct = fetchByte();
         uint16_t value = readDirectWord(direct);
@@ -1835,6 +1993,21 @@ int APU::stepInstruction() {
     case 0xBD:
         sp = x;
         return 2;
+    case 0xBE: {
+        uint16_t value = a;
+        if (!getFlag(kFlagC) || value > 0x99) {
+            value = (uint16_t)(value - 0x60);
+            setFlag(kFlagC, false);
+        } else {
+            setFlag(kFlagC, true);
+        }
+        if (!getFlag(kFlagH) || (value & 0x0F) > 0x09) {
+            value = (uint16_t)(value - 0x06);
+        }
+        a = (uint8_t)value;
+        setNZ8(a);
+        return 3;
+    }
     case 0xBF:
         a = readMem(directPageAddress(x));
         x++;
@@ -1862,6 +2035,16 @@ int APU::stepInstruction() {
     case 0xC9:
         writeMem(fetchWord(), x);
         return 5;
+    case 0xCA: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        uint8_t value = readMem(addr);
+        const uint8_t mask = (uint8_t)(1u << bit);
+        value = getFlag(kFlagC) ? (uint8_t)(value | mask) : (uint8_t)(value & ~mask);
+        writeMem(addr, value);
+        return 6;
+    }
     case 0xCB:
         writeMem(directPageAddress(fetchByte()), y);
         return 4;
@@ -1939,6 +2122,21 @@ int APU::stepInstruction() {
         }
         return 6;
     }
+    case 0xDF: {
+        uint16_t value = a;
+        if (getFlag(kFlagC) || value > 0x99) {
+            value = (uint16_t)(value + 0x60);
+            setFlag(kFlagC, true);
+        } else {
+            setFlag(kFlagC, false);
+        }
+        if (getFlag(kFlagH) || (value & 0x0F) > 0x09) {
+            value = (uint16_t)(value + 0x06);
+        }
+        a = (uint8_t)value;
+        setNZ8(a);
+        return 3;
+    }
 
     case 0xE0:
         setFlag(kFlagV, false);
@@ -1968,6 +2166,15 @@ int APU::stepInstruction() {
         x = readMem(fetchWord());
         setNZ8(x);
         return 4;
+    case 0xEA: {
+        uint16_t addr = 0;
+        uint8_t bit = 0;
+        decodeBitAddress(addr, bit);
+        uint8_t value = readMem(addr);
+        value ^= (uint8_t)(1u << bit);
+        writeMem(addr, value);
+        return 5;
+    }
     case 0xEB:
         y = readMem(directPageAddress(fetchByte()));
         setNZ8(y);
@@ -2012,6 +2219,15 @@ int APU::stepInstruction() {
         x = readMem(directPageIndexedY(fetchByte()));
         setNZ8(x);
         return 4;
+    case 0xFA: {
+        uint8_t src_direct = fetchByte();
+        uint8_t dst_direct = fetchByte();
+        const uint8_t value = readMem(directPageAddress(src_direct));
+        const uint16_t dst_addr = directPageAddress(dst_direct);
+        (void)readMem(dst_addr);
+        writeMem(dst_addr, value);
+        return 5;
+    }
     case 0xFB:
         y = readMem(directPageIndexedX(fetchByte()));
         setNZ8(y);

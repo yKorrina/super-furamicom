@@ -12,6 +12,12 @@
 namespace {
 constexpr int kMenuWidth = 256;
 constexpr int kMenuHeight = 224;
+constexpr int kRomRowHeight = 15;
+constexpr int kVisibleRomRows = 8;
+constexpr int kPrettyGlyphWidth = 5;
+constexpr int kPrettyGlyphHeight = 7;
+constexpr int kPrettyGlyphAdvance = 6;
+constexpr const char* kLauncherSettingsPath = "launcher.cfg";
 
 static const uint32_t MINI_FONT[] = {
     0x000000,0x448400,0xAA0000,0xAEAEA0,0x4E6E40,0xA26480,0x4A4AC0,0x440000,
@@ -28,18 +34,139 @@ static const uint32_t MINI_FONT[] = {
     0x0A44A0,0x0AA620,0x0E24E0,0x648460,0x444440,0xC424C0,0x05A000,0x000000,
 };
 
+struct PrettyGlyph {
+    char ch;
+    const char* rows[kPrettyGlyphHeight];
+};
+
+static const PrettyGlyph PRETTY_FONT[] = {
+    {'A', {" ### ","#   #","#   #","#####","#   #","#   #","#   #"}},
+    {'B', {"#### ","#   #","#   #","#### ","#   #","#   #","#### "}},
+    {'C', {" ### ","#   #","#    ","#    ","#    ","#   #"," ### "}},
+    {'D', {"#### ","#   #","#   #","#   #","#   #","#   #","#### "}},
+    {'E', {"#####","#    ","#    ","#### ","#    ","#    ","#####"}},
+    {'F', {"#####","#    ","#    ","#### ","#    ","#    ","#    "}},
+    {'G', {" ####","#    ","#    ","# ###","#   #","#   #"," ####"}},
+    {'H', {"#   #","#   #","#   #","#####","#   #","#   #","#   #"}},
+    {'I', {"#####","  #  ","  #  ","  #  ","  #  ","  #  ","#####"}},
+    {'J', {"#####","    #","    #","    #","#   #","#   #"," ### "}},
+    {'K', {"#   #","#  # ","# #  ","##   ","# #  ","#  # ","#   #"}},
+    {'L', {"#    ","#    ","#    ","#    ","#    ","#    ","#####"}},
+    {'M', {"#   #","## ##","# # #","# # #","#   #","#   #","#   #"}},
+    {'N', {"#   #","##  #","# # #","#  ##","#   #","#   #","#   #"}},
+    {'O', {" ### ","#   #","#   #","#   #","#   #","#   #"," ### "}},
+    {'P', {"#### ","#   #","#   #","#### ","#    ","#    ","#    "}},
+    {'Q', {" ### ","#   #","#   #","#   #","# # #","#  ##"," ####"}},
+    {'R', {"#### ","#   #","#   #","#### ","# #  ","#  # ","#   #"}},
+    {'S', {" ####","#    ","#    "," ### ","    #","    #","#### "}},
+    {'T', {"#####","  #  ","  #  ","  #  ","  #  ","  #  ","  #  "}},
+    {'U', {"#   #","#   #","#   #","#   #","#   #","#   #"," ### "}},
+    {'V', {"#   #","#   #","#   #","#   #","#   #"," # # ","  #  "}},
+    {'W', {"#   #","#   #","#   #","# # #","# # #","## ##","#   #"}},
+    {'X', {"#   #","#   #"," # # ","  #  "," # # ","#   #","#   #"}},
+    {'Y', {"#   #","#   #"," # # ","  #  ","  #  ","  #  ","  #  "}},
+    {'Z', {"#####","    #","   # ","  #  "," #   ","#    ","#####"}},
+    {'0', {" ### ","#   #","#  ##","# # #","##  #","#   #"," ### "}},
+    {'1', {"  #  "," ##  ","  #  ","  #  ","  #  ","  #  ","#####"}},
+    {'2', {" ### ","#   #","    #","   # ","  #  "," #   ","#####"}},
+    {'3', {" ### ","#   #","    #"," ### ","    #","#   #"," ### "}},
+    {'4', {"   # ","  ## "," # # ","#  # ","#####","   # ","   # "}},
+    {'5', {"#####","#    ","#    ","#### ","    #","#   #"," ### "}},
+    {'6', {" ### ","#   #","#    ","#### ","#   #","#   #"," ### "}},
+    {'7', {"#####","    #","   # ","  #  "," #   "," #   "," #   "}},
+    {'8', {" ### ","#   #","#   #"," ### ","#   #","#   #"," ### "}},
+    {'9', {" ### ","#   #","#   #"," ####","    #","#   #"," ### "}},
+    {'.', {"     ","     ","     ","     ","     "," ##  "," ##  "}},
+    {'/', {"    #","   # ","   # ","  #  "," #   "," #   ","#    "}},
+    {'-', {"     ","     ","     ","#####","     ","     ","     "}},
+    {':', {"     "," ##  "," ##  ","     "," ##  "," ##  ","     "}},
+    {'+', {"     ","  #  ","  #  ","#####","  #  ","  #  ","     "}},
+    {',', {"     ","     ","     ","     "," ##  "," ##  "," #   "}},
+    {'!', {"  #  ","  #  ","  #  ","  #  ","  #  ","     ","  #  "}},
+    {'?', {" ### ","#   #","    #","   # ","  #  ","     ","  #  "}},
+    {'(', {"   # ","  #  "," #   "," #   "," #   ","  #  ","   # "}},
+    {')', {" #   ","  #  ","   # ","   # ","   # ","  #  "," #   "}},
+    {' ', {"     ","     ","     ","     ","     ","     ","     "}},
+};
+
 enum class LauncherView {
     Main,
     Controls,
 };
 
+enum class LauncherTheme : uint8_t {
+    Midnight = 0,
+    Aurora = 1,
+    Ember = 2,
+};
+
 enum class MainFocus {
     RomList,
     Visualizer,
+    Theme,
     Controls,
     Start,
     Quit,
 };
+
+struct LauncherPalette {
+    const char* name;
+    uint32_t bg_top;
+    uint32_t bg_bottom;
+    uint32_t bg_diag;
+    uint32_t bg_grid;
+    uint32_t top_bar;
+    uint32_t panel_fill;
+    uint32_t panel_border;
+    uint32_t panel_border_focus;
+    uint32_t options_fill;
+    uint32_t options_border;
+    uint32_t row_fill;
+    uint32_t row_active;
+    uint32_t row_idle_border;
+    uint32_t option_fill;
+    uint32_t option_active;
+    uint32_t option_border;
+    uint32_t title;
+    uint32_t header;
+    uint32_t text;
+    uint32_t text_soft;
+    uint32_t status;
+    uint32_t rom_status;
+    uint32_t warning;
+    uint32_t shadow;
+    uint32_t check_fill;
+};
+
+constexpr std::array<LauncherPalette, 3> kLauncherPalettes = {{
+    {
+        "MIDNIGHT",
+        0xFF081018u, 0xFF112337u, 0xFF1A2733u, 0xFF12202Bu,
+        0xFF071015u, 0xFF141E26u, 0xFF5E8395u, 0xFFFFE7A0u,
+        0xFF17222Bu, 0xFF62889Au, 0xFF1E2C36u, 0xFF2D5E6Fu,
+        0xFF88B3C7u, 0xFF1D2A33u, 0xFF2F5160u, 0xFF7BA1B4u,
+        0xFFFFE7A0u, 0xFF9DCEE0u, 0xFFFFFFFFu, 0xFFD7EEF7u,
+        0xFFFFAA7Au, 0xFFCAEFBAu, 0xFFFFB18Au, 0xFF071018u, 0xFFFFE7A0u,
+    },
+    {
+        "AURORA",
+        0xFF091310u, 0xFF183A31u, 0xFF1E3A33u, 0xFF122C26u,
+        0xFF08120Fu, 0xFF15251Fu, 0xFF74A88Eu, 0xFFF5FFB9u,
+        0xFF162721u, 0xFF82B79Bu, 0xFF22352Du, 0xFF3A6E5Du,
+        0xFFA2D3B8u, 0xFF203229u, 0xFF345F51u, 0xFF86BBA3u,
+        0xFFF5FFB9u, 0xFFB0F0DAu, 0xFFFFFFFFu, 0xFFDDF7ECu,
+        0xFFFFC78Fu, 0xFFD2F5B8u, 0xFFFFC29Au, 0xFF09130Fu, 0xFFF5FFB9u,
+    },
+    {
+        "EMBER",
+        0xFF140B09u, 0xFF35211Au, 0xFF3A241Cu, 0xFF271711u,
+        0xFF160A08u, 0xFF241612u, 0xFFCC8C5Du, 0xFFFFE2A3u,
+        0xFF281A16u, 0xFFD1986Au, 0xFF38241Cu, 0xFF7A4A34u,
+        0xFFE6B184u, 0xFF2F1E18u, 0xFF6B4130u, 0xFFDAA077u,
+        0xFFFFD68Eu, 0xFFFFC9A0u, 0xFFFFFFFFu, 0xFFFFECDCu,
+        0xFFFFAD80u, 0xFFE6F3B0u, 0xFFFFC09Bu, 0xFF140A08u, 0xFFFFE2A3u,
+    },
+}};
 
 constexpr std::array<InputBindingDefinition, kInputBindingCount> kBindings = {{
     {"B",      0x8000, SDL_SCANCODE_X},
@@ -56,25 +183,71 @@ constexpr std::array<InputBindingDefinition, kInputBindingCount> kBindings = {{
     {"R",      0x0400, SDL_SCANCODE_W},
 }};
 
-void drawChar(uint32_t* pixels, int stride, int height, int cx, int cy, char ch, uint32_t color) {
+const PrettyGlyph* findPrettyGlyph(char ch) {
+    for (const PrettyGlyph& glyph : PRETTY_FONT) {
+        if (glyph.ch == ch) return &glyph;
+    }
+    return nullptr;
+}
+
+void drawChar(uint32_t* pixels, int stride, int height, int cx, int cy, char ch, uint32_t color, int scale = 1) {
+    scale = std::max(1, scale);
+    if (const PrettyGlyph* glyph = findPrettyGlyph(ch)) {
+        for (int y = 0; y < kPrettyGlyphHeight; y++) {
+            for (int x = 0; x < kPrettyGlyphWidth; x++) {
+                if (glyph->rows[y][x] == ' ') continue;
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        const int px = cx + x * scale + sx;
+                        const int py = cy + y * scale + sy;
+                        if (px >= 0 && px < stride && py >= 0 && py < height) {
+                            pixels[py * stride + px] = color;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
     if (ch < 32 || ch > 127) return;
     const uint32_t glyph = MINI_FONT[ch - 32];
     for (int y = 0; y < 6; y++) {
         for (int x = 0; x < 4; x++) {
             if (((glyph >> (23 - (y * 4 + x))) & 1u) == 0) continue;
-            const int px = cx + x;
-            const int py = cy + y;
-            if (px >= 0 && px < stride && py >= 0 && py < height) {
-                pixels[py * stride + px] = color;
+            for (int sy = 0; sy < scale; sy++) {
+                for (int sx = 0; sx < scale; sx++) {
+                    const int px = cx + x * scale + sx;
+                    const int py = cy + y * scale + sy;
+                    if (px >= 0 && px < stride && py >= 0 && py < height) {
+                        pixels[py * stride + px] = color;
+                    }
+                }
             }
         }
     }
 }
 
-void drawText(uint32_t* pixels, int x, int y, std::string_view text, uint32_t color) {
+void drawText(uint32_t* pixels, int x, int y, std::string_view text, uint32_t color, int scale = 1) {
     for (std::size_t i = 0; i < text.size(); i++) {
-        drawChar(pixels, kMenuWidth, kMenuHeight, x + (int)i * 5, y, text[i], color);
+        drawChar(pixels, kMenuWidth, kMenuHeight, x + (int)i * kPrettyGlyphAdvance * scale, y, text[i], color, scale);
     }
+}
+
+void drawTextShadow(uint32_t* pixels,
+                    int x,
+                    int y,
+                    std::string_view text,
+                    uint32_t color,
+                    int scale = 1,
+                    uint32_t shadow = 0xFF071018u) {
+    drawText(pixels, x + scale, y + scale, text, shadow, scale);
+    drawText(pixels, x, y, text, color, scale);
+}
+
+int textWidth(std::string_view text, int scale = 1) {
+    if (text.empty()) return 0;
+    return (int)text.size() * kPrettyGlyphAdvance * scale - scale;
 }
 
 void drawRect(uint32_t* pixels, int x, int y, int w, int h, uint32_t color) {
@@ -95,6 +268,25 @@ void drawOutline(uint32_t* pixels, int x, int y, int w, int h, uint32_t color) {
     drawRect(pixels, x, y + h - 1, w, 1, color);
     drawRect(pixels, x, y, 1, h, color);
     drawRect(pixels, x + w - 1, y, 1, h, color);
+}
+
+uint32_t lerpColor(uint32_t lhs, uint32_t rhs, int index, int count) {
+    if (count <= 0) return lhs;
+
+    auto lerp = [index, count](int a, int b) {
+        return a + ((b - a) * index) / count;
+    };
+
+    const int lr = (lhs >> 16) & 0xFF;
+    const int lg = (lhs >> 8) & 0xFF;
+    const int lb = lhs & 0xFF;
+    const int rr = (rhs >> 16) & 0xFF;
+    const int rg = (rhs >> 8) & 0xFF;
+    const int rb = rhs & 0xFF;
+    return 0xFF000000u
+        | ((uint32_t)lerp(lr, rr) << 16)
+        | ((uint32_t)lerp(lg, rg) << 8)
+        | (uint32_t)lerp(lb, rb);
 }
 
 std::string upperCopy(std::string text) {
@@ -120,6 +312,64 @@ std::string trimLine(const std::string& text) {
     std::size_t last = text.size();
     while (last > first && std::isspace((unsigned char)text[last - 1])) last--;
     return text.substr(first, last - first);
+}
+
+const LauncherPalette& paletteForTheme(LauncherTheme theme) {
+    const std::size_t index = std::min<std::size_t>((std::size_t)theme, kLauncherPalettes.size() - 1);
+    return kLauncherPalettes[index];
+}
+
+std::string_view launcherThemeName(LauncherTheme theme) {
+    return paletteForTheme(theme).name;
+}
+
+LauncherTheme nextLauncherTheme(LauncherTheme theme) {
+    const std::size_t index = ((std::size_t)theme + 1) % kLauncherPalettes.size();
+    return (LauncherTheme)index;
+}
+
+bool parseLauncherTheme(const std::string& text, LauncherTheme& theme) {
+    const std::string upper = upperCopy(trimLine(text));
+    for (std::size_t i = 0; i < kLauncherPalettes.size(); i++) {
+        if (upper == kLauncherPalettes[i].name) {
+            theme = (LauncherTheme)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LoadLauncherTheme(const std::string& path, LauncherTheme& theme) {
+    theme = LauncherTheme::Midnight;
+
+    std::ifstream in(path);
+    if (!in) return false;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        line = trimLine(line);
+        if (line.empty() || line[0] == '#') continue;
+
+        const std::size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        const std::string key = upperCopy(trimLine(line.substr(0, eq)));
+        const std::string value = trimLine(line.substr(eq + 1));
+        if (key == "THEME" && parseLauncherTheme(value, theme)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool SaveLauncherTheme(const std::string& path, LauncherTheme theme) {
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return false;
+
+    out << "# Super Furamicom launcher settings\n";
+    out << "THEME=" << launcherThemeName(theme) << "\n";
+    return (bool)out;
 }
 
 std::string clipText(const std::string& text, int max_chars) {
@@ -154,13 +404,15 @@ SDL_Point toLogicalPoint(SDL_Renderer* renderer, int window_x, int window_y) {
 }
 
 struct MainLayout {
-    SDL_Rect rom_panel{12, 24, 152, 170};
-    SDL_Rect rom_list{18, 42, 140, 132};
-    SDL_Rect visualize_box{182, 40, 50, 16};
-    SDL_Rect visualize_check{182, 40, 10, 10};
-    SDL_Rect controls_button{176, 72, 60, 18};
-    SDL_Rect start_button{176, 100, 60, 18};
-    SDL_Rect quit_button{176, 128, 60, 18};
+    SDL_Rect rom_panel{12, 34, 152, 154};
+    SDL_Rect rom_list{18, 58, 140, kVisibleRomRows * kRomRowHeight};
+    SDL_Rect options_panel{168, 34, 80, 154};
+    SDL_Rect visualize_box{174, 50, 68, 16};
+    SDL_Rect visualize_check{174, 53, 10, 10};
+    SDL_Rect theme_button{174, 82, 68, 16};
+    SDL_Rect controls_button{174, 106, 68, 18};
+    SDL_Rect start_button{174, 132, 68, 18};
+    SDL_Rect quit_button{174, 158, 68, 18};
 };
 
 bool pointInRect(int x, int y, const SDL_Rect& rect) {
@@ -173,75 +425,104 @@ void drawMainView(uint32_t* pixels,
                   int rom_scroll,
                   MainFocus focus,
                   bool visualize,
+                  LauncherTheme theme,
                   const std::string& status) {
+    const LauncherPalette& palette = paletteForTheme(theme);
     for (int y = 0; y < kMenuHeight; y++) {
-        const uint8_t shade = (uint8_t)(8 + (y * 20) / std::max(1, kMenuHeight - 1));
-        const uint32_t color = 0xFF000000u | ((uint32_t)(shade / 2) << 16) | ((uint32_t)shade << 8) | (uint32_t)(shade + 8);
+        const uint32_t color = lerpColor(palette.bg_top, palette.bg_bottom, y, std::max(1, kMenuHeight - 1));
         for (int x = 0; x < kMenuWidth; x++) {
-            pixels[(std::size_t)y * kMenuWidth + x] = color;
+            uint32_t pixel = color;
+            if (((x + y) & 0x0F) == 0) {
+                pixel = palette.bg_diag;
+            } else if ((x % 32) == 0) {
+                pixel = palette.bg_grid;
+            }
+            pixels[(std::size_t)y * kMenuWidth + x] = pixel;
         }
     }
 
     const MainLayout layout;
-    drawRect(pixels, layout.rom_panel.x, layout.rom_panel.y, layout.rom_panel.w, layout.rom_panel.h, 0xFF0C141B);
+    drawRect(pixels, 0, 0, kMenuWidth, 28, palette.top_bar);
+    drawRect(pixels, layout.rom_panel.x, layout.rom_panel.y, layout.rom_panel.w, layout.rom_panel.h, palette.panel_fill);
     drawOutline(pixels, layout.rom_panel.x, layout.rom_panel.y, layout.rom_panel.w, layout.rom_panel.h,
-                focus == MainFocus::RomList ? 0xFFFFE7A0 : 0xFF476170);
-    drawRect(pixels, 172, 24, 72, 170, 0xFF111A22);
-    drawOutline(pixels, 172, 24, 72, 170, 0xFF506A79);
+                focus == MainFocus::RomList ? palette.panel_border_focus : palette.panel_border);
+    drawRect(pixels, layout.options_panel.x, layout.options_panel.y, layout.options_panel.w, layout.options_panel.h,
+             palette.options_fill);
+    drawOutline(pixels, layout.options_panel.x, layout.options_panel.y, layout.options_panel.w, layout.options_panel.h,
+                palette.options_border);
 
-    drawText(pixels, 14, 10, "SUPER FURAMICOM", 0xFFFFE7A0);
-    drawText(pixels, 15, 18, "ROMS", 0xFF88B3C7);
-    drawText(pixels, 177, 18, "OPTIONS", 0xFF88B3C7);
+    drawTextShadow(pixels, 14, 7, "SUPER FURAMICOM", palette.title, 2, palette.shadow);
+    drawTextShadow(pixels, 18, 25, "ROM LIBRARY", palette.header, 1, palette.shadow);
+    drawTextShadow(pixels, 176, 25, "OPTIONS", palette.header, 1, palette.shadow);
 
-    const int visible_rows = 12;
-    for (int row = 0; row < visible_rows; row++) {
+    for (int row = 0; row < kVisibleRomRows; row++) {
         const int rom_index = rom_scroll + row;
-        const int y = layout.rom_list.y + row * 11;
+        const int y = layout.rom_list.y + row * kRomRowHeight;
         const bool selected = rom_index == selected_rom && rom_index < (int)rom_paths.size();
+        drawRect(pixels, layout.rom_list.x - 3, y - 2, layout.rom_list.w + 2, 13, palette.row_fill);
         if (selected) {
-            drawRect(pixels, layout.rom_list.x - 2, y - 1, layout.rom_list.w, 9,
-                     focus == MainFocus::RomList ? 0xFF214D62 : 0xFF1A3340);
+            drawRect(pixels, layout.rom_list.x - 3, y - 2, layout.rom_list.w + 2, 13,
+                     focus == MainFocus::RomList ? palette.row_active : palette.option_fill);
+            drawOutline(pixels, layout.rom_list.x - 3, y - 2, layout.rom_list.w + 2, 13,
+                        focus == MainFocus::RomList ? palette.panel_border_focus : palette.row_idle_border);
         }
 
         if (rom_index < (int)rom_paths.size()) {
-            drawText(pixels, layout.rom_list.x, y,
-                     clipText(romLabel(rom_paths[(std::size_t)rom_index]), 27),
-                     selected ? 0xFFFFFFFFu : 0xFFCEE7F0u);
+            const std::string label = clipText(romLabel(rom_paths[(std::size_t)rom_index]), 23);
+            drawTextShadow(pixels,
+                           layout.rom_list.x,
+                           y + 1,
+                           label,
+                           selected ? palette.text : palette.text_soft,
+                           1,
+                           palette.shadow);
         }
     }
 
     if (rom_paths.empty()) {
-        drawText(pixels, 22, 90, "NO .SFC/.SMC FILES", 0xFFFFAA7A);
-        drawText(pixels, 22, 100, "FOUND IN ROMS FOLDER", 0xFFFFAA7A);
+        drawTextShadow(pixels, 26, 94, "NO ROMS FOUND", palette.warning, 2, palette.shadow);
+        drawTextShadow(pixels, 28, 122, "DROP .SFC OR .SMC FILES INTO /ROMS", palette.header, 1, palette.shadow);
     }
 
-    const uint32_t option_fill = 0xFF19242C;
-    const uint32_t option_active = 0xFF25404F;
-    const uint32_t option_border = 0xFF5F879A;
     auto drawButton = [&](const SDL_Rect& rect, MainFocus id, std::string_view label) {
-        drawRect(pixels, rect.x, rect.y, rect.w, rect.h, focus == id ? option_active : option_fill);
-        drawOutline(pixels, rect.x, rect.y, rect.w, rect.h, focus == id ? 0xFFFFE7A0 : option_border);
-        drawText(pixels, rect.x + 8, rect.y + 6, label, 0xFFFFFFFFu);
+        drawRect(pixels, rect.x, rect.y, rect.w, rect.h, focus == id ? palette.option_active : palette.option_fill);
+        drawOutline(pixels, rect.x, rect.y, rect.w, rect.h,
+                    focus == id ? palette.panel_border_focus : palette.option_border);
+        drawTextShadow(pixels,
+                       rect.x + std::max(4, (rect.w - textWidth(label)) / 2),
+                       rect.y + std::max(4, (rect.h - kPrettyGlyphHeight) / 2),
+                       label,
+                       palette.text,
+                       1,
+                       palette.shadow);
     };
 
-    drawText(pixels, 196, 42, "VIS", 0xFFFFFFFFu);
+    drawTextShadow(pixels, 188, 52, "VISUALIZER", palette.text, 1, palette.shadow);
     drawRect(pixels, layout.visualize_check.x, layout.visualize_check.y, 10, 10,
-             focus == MainFocus::Visualizer ? option_active : option_fill);
+             focus == MainFocus::Visualizer ? palette.option_active : palette.option_fill);
     drawOutline(pixels, layout.visualize_check.x, layout.visualize_check.y, 10, 10,
-                focus == MainFocus::Visualizer ? 0xFFFFE7A0 : option_border);
+                focus == MainFocus::Visualizer ? palette.panel_border_focus : palette.option_border);
     if (visualize) {
-        drawRect(pixels, layout.visualize_check.x + 2, layout.visualize_check.y + 2, 6, 6, 0xFFFFE7A0);
+        drawRect(pixels, layout.visualize_check.x + 2, layout.visualize_check.y + 2, 6, 6, palette.check_fill);
     }
 
+    drawTextShadow(pixels, 192, 72, "THEME", palette.header, 1, palette.shadow);
+    drawButton(layout.theme_button, MainFocus::Theme, launcherThemeName(theme));
     drawButton(layout.controls_button, MainFocus::Controls, "CONTROLS");
     drawButton(layout.start_button, MainFocus::Start, "START");
     drawButton(layout.quit_button, MainFocus::Quit, "QUIT");
 
-    drawText(pixels, 12, 198, "ARROWS MOVE  ENTER SELECT  ESC QUIT", 0xFF93B6C1);
+    drawTextShadow(pixels, 12, 198, "ARROWS MOVE  ENTER SELECT  ESC QUIT", palette.header, 1, palette.shadow);
     if (!status.empty()) {
-        drawText(pixels, 12, 208, clipText(upperCopy(status), 48), 0xFFFFAA7A);
+        drawTextShadow(pixels, 12, 212, clipText(upperCopy(status), 38), palette.status, 1, palette.shadow);
     } else if (!rom_paths.empty()) {
-        drawText(pixels, 12, 208, clipText(romLabel(rom_paths[(std::size_t)selected_rom]), 48), 0xFFBFE5A9);
+        drawTextShadow(pixels,
+                       12,
+                       212,
+                       clipText(romLabel(rom_paths[(std::size_t)selected_rom]), 38),
+                       palette.rom_status,
+                       1,
+                       palette.shadow);
     }
 }
 
@@ -249,36 +530,42 @@ void drawControlsView(uint32_t* pixels,
                       const InputConfig& config,
                       int selected_binding,
                       bool waiting_for_key,
+                      LauncherTheme theme,
                       const std::string& status) {
-    drawRect(pixels, 0, 0, kMenuWidth, kMenuHeight, 0xFF0B1218);
-    drawRect(pixels, 10, 18, 236, 190, 0xFF101922);
-    drawOutline(pixels, 10, 18, 236, 190, 0xFF5A7C8D);
+    const LauncherPalette& palette = paletteForTheme(theme);
+    drawRect(pixels, 0, 0, kMenuWidth, kMenuHeight, palette.bg_top);
+    drawRect(pixels, 10, 18, 236, 190, palette.panel_fill);
+    drawOutline(pixels, 10, 18, 236, 190, palette.options_border);
 
-    drawText(pixels, 16, 10, "CONTROL MAPPING", 0xFFFFE7A0);
-    drawText(pixels, 16, 24, "ENTER REBINDS  BACKSPACE DEFAULT", 0xFF9BC0D0);
-    drawText(pixels, 16, 32, "F9 RESET ALL   ESC BACK", 0xFF9BC0D0);
+    drawTextShadow(pixels, 16, 7, "CONTROL MAPPING", palette.title, 2, palette.shadow);
+    drawTextShadow(pixels, 16, 28, "ENTER REBINDS  BACKSPACE DEFAULT", palette.header, 1, palette.shadow);
+    drawTextShadow(pixels, 16, 36, "F9 RESET ALL   ESC BACK", palette.header, 1, palette.shadow);
 
     for (int i = 0; i < (int)kBindings.size(); i++) {
-        const int y = 48 + i * 12;
+        const int y = 54 + i * 12;
         if (i == selected_binding) {
-            drawRect(pixels, 18, y - 2, 220, 10, waiting_for_key ? 0xFF693117 : 0xFF214D62);
-            drawOutline(pixels, 18, y - 2, 220, 10, 0xFFFFE7A0);
+            drawRect(pixels, 18, y - 2, 220, 10, waiting_for_key ? 0xFF693117u : palette.row_active);
+            drawOutline(pixels, 18, y - 2, 220, 10, palette.panel_border_focus);
         }
 
-        drawText(pixels, 24, y, kBindings[(std::size_t)i].label, 0xFFFFFFFFu);
-        drawText(pixels, 96, y,
-                 clipText(keyName(config.scancodes[(std::size_t)i]), 26),
-                 i == selected_binding ? 0xFFFFF7C5u : 0xFFCEE7F0u);
+        drawTextShadow(pixels, 24, y, kBindings[(std::size_t)i].label, palette.text, 1, palette.shadow);
+        drawTextShadow(pixels,
+                       96,
+                       y,
+                       clipText(keyName(config.scancodes[(std::size_t)i]), 22),
+                       i == selected_binding ? palette.title : palette.text_soft,
+                       1,
+                       palette.shadow);
     }
 
     if (waiting_for_key) {
-        drawRect(pixels, 40, 176, 176, 20, 0xFF2A1410);
-        drawOutline(pixels, 40, 176, 176, 20, 0xFFFFB27A);
-        drawText(pixels, 54, 183, "PRESS A KEY...", 0xFFFFE7A0);
+        drawRect(pixels, 40, 176, 176, 20, 0xFF2A1410u);
+        drawOutline(pixels, 40, 176, 176, 20, palette.warning);
+        drawTextShadow(pixels, 54, 183, "PRESS A KEY...", palette.title, 1, palette.shadow);
     }
 
     if (!status.empty()) {
-        drawText(pixels, 16, 212, clipText(upperCopy(status), 48), 0xFFFFAA7A);
+        drawTextShadow(pixels, 16, 212, clipText(upperCopy(status), 40), palette.status, 1, palette.shadow);
     }
 }
 }
@@ -390,6 +677,8 @@ LauncherResult RunLauncher(SDL_Window* window,
     std::string status;
     uint32_t last_click_ticks = 0;
     int last_click_rom = -1;
+    LauncherTheme theme = LauncherTheme::Midnight;
+    LoadLauncherTheme(kLauncherSettingsPath, theme);
 
     SDL_SetWindowTitle(window, "Super Furamicom Launcher");
 
@@ -478,6 +767,11 @@ LauncherResult RunLauncher(SDL_Window* window,
                     break;
                 case SDLK_SPACE:
                     if (focus == MainFocus::Visualizer) result.visualize = !result.visualize;
+                    else if (focus == MainFocus::Theme) {
+                        theme = nextLauncherTheme(theme);
+                        SaveLauncherTheme(kLauncherSettingsPath, theme);
+                        status = std::string("THEME ") + std::string(launcherThemeName(theme));
+                    }
                     break;
                 case SDLK_RETURN:
                     if (focus == MainFocus::RomList || focus == MainFocus::Start) {
@@ -490,6 +784,10 @@ LauncherResult RunLauncher(SDL_Window* window,
                         }
                     } else if (focus == MainFocus::Visualizer) {
                         result.visualize = !result.visualize;
+                    } else if (focus == MainFocus::Theme) {
+                        theme = nextLauncherTheme(theme);
+                        SaveLauncherTheme(kLauncherSettingsPath, theme);
+                        status = std::string("THEME ") + std::string(launcherThemeName(theme));
                     } else if (focus == MainFocus::Controls) {
                         view = LauncherView::Controls;
                         status.clear();
@@ -502,7 +800,9 @@ LauncherResult RunLauncher(SDL_Window* window,
                 }
 
                 if (selected_rom >= 0) {
-                    rom_scroll = std::clamp(selected_rom - 5, 0, std::max(0, (int)rom_paths.size() - 12));
+                    rom_scroll = std::clamp(selected_rom - (kVisibleRomRows / 2),
+                                            0,
+                                            std::max(0, (int)rom_paths.size() - kVisibleRomRows));
                 }
             }
 
@@ -513,7 +813,7 @@ LauncherResult RunLauncher(SDL_Window* window,
                 if (view == LauncherView::Controls) {
                     if (pointInRect(point.x, point.y, SDL_Rect{10, 18, 236, 190})) {
                         for (int i = 0; i < (int)kBindings.size(); i++) {
-                            const SDL_Rect row{18, 46 + i * 12, 220, 10};
+                            const SDL_Rect row{18, 52 + i * 12, 220, 10};
                             if (pointInRect(point.x, point.y, row)) {
                                 selected_binding = i;
                                 waiting_for_key = true;
@@ -529,7 +829,7 @@ LauncherResult RunLauncher(SDL_Window* window,
 
                 const MainLayout layout;
                 if (pointInRect(point.x, point.y, layout.rom_list)) {
-                    const int row = (point.y - layout.rom_list.y) / 11;
+                    const int row = (point.y - layout.rom_list.y) / kRomRowHeight;
                     const int rom_index = rom_scroll + row;
                     if (rom_index >= 0 && rom_index < (int)rom_paths.size()) {
                         focus = MainFocus::RomList;
@@ -546,6 +846,11 @@ LauncherResult RunLauncher(SDL_Window* window,
                 } else if (pointInRect(point.x, point.y, layout.visualize_box)) {
                     focus = MainFocus::Visualizer;
                     result.visualize = !result.visualize;
+                } else if (pointInRect(point.x, point.y, layout.theme_button)) {
+                    focus = MainFocus::Theme;
+                    theme = nextLauncherTheme(theme);
+                    SaveLauncherTheme(kLauncherSettingsPath, theme);
+                    status = std::string("THEME ") + std::string(launcherThemeName(theme));
                 } else if (pointInRect(point.x, point.y, layout.controls_button)) {
                     focus = MainFocus::Controls;
                     view = LauncherView::Controls;
@@ -565,13 +870,15 @@ LauncherResult RunLauncher(SDL_Window* window,
         }
 
         if (selected_rom >= 0) {
-            rom_scroll = std::clamp(selected_rom - 5, 0, std::max(0, (int)rom_paths.size() - 12));
+            rom_scroll = std::clamp(selected_rom - (kVisibleRomRows / 2),
+                                    0,
+                                    std::max(0, (int)rom_paths.size() - kVisibleRomRows));
         }
 
         if (view == LauncherView::Main) {
-            drawMainView(pixels.data(), rom_paths, selected_rom, rom_scroll, focus, result.visualize, status);
+            drawMainView(pixels.data(), rom_paths, selected_rom, rom_scroll, focus, result.visualize, theme, status);
         } else {
-            drawControlsView(pixels.data(), result.input_config, selected_binding, waiting_for_key, status);
+            drawControlsView(pixels.data(), result.input_config, selected_binding, waiting_for_key, theme, status);
         }
 
         SDL_UpdateTexture(texture, nullptr, pixels.data(), kMenuWidth * (int)sizeof(uint32_t));

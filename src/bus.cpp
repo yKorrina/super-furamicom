@@ -12,6 +12,40 @@ Bus::Bus(CPU* c, PPU* p, APU* a) : cpu(c), ppu(p), apu(a) {
 
 void Bus::insertCartridge(Cartridge* cart) { cartridge = cart; }
 
+uint16_t Bus::encodeJoypadState(uint16_t state) {
+    uint16_t encoded = 0;
+    if (state & 0x8000) encoded |= 0x8000; // B
+    if (state & 0x4000) encoded |= 0x4000; // Y
+    if (state & 0x2000) encoded |= 0x2000; // Select
+    if (state & 0x1000) encoded |= 0x1000; // Start
+    if (state & 0x0008) encoded |= 0x0800; // Up
+    if (state & 0x0004) encoded |= 0x0400; // Down
+    if (state & 0x0002) encoded |= 0x0200; // Left
+    if (state & 0x0001) encoded |= 0x0100; // Right
+    if (state & 0x0080) encoded |= 0x0080; // A
+    if (state & 0x0040) encoded |= 0x0040; // X
+    if (state & 0x0800) encoded |= 0x0020; // L
+    if (state & 0x0400) encoded |= 0x0010; // R
+    return encoded;
+}
+
+void Bus::latchJoypads() {
+    joy1_shift = encodeJoypadState(joy1_state);
+    joy2_shift = encodeJoypadState(joy2_state);
+}
+
+uint8_t Bus::readJoypadSerial(int port) {
+    const uint16_t live = encodeJoypadState(port == 0 ? joy1_state : joy2_state);
+    uint16_t& shift = (port == 0) ? joy1_shift : joy2_shift;
+    if (joypad_strobe) {
+        return (uint8_t)((live >> 15) & 0x01);
+    }
+
+    const uint8_t bit = (uint8_t)((shift >> 15) & 0x01);
+    shift = (uint16_t)((shift << 1) | 0x0001);
+    return bit;
+}
+
 void Bus::beginFrame() {
     irq_fired_this_scanline = false;
     for (int i = 0; i < 8; i++) {
@@ -31,6 +65,12 @@ void Bus::beginFrame() {
 
 void Bus::startVBlank() {
     nmi_pending = true;
+    if (nmitimen & 0x01) {
+        auto_joypad_busy = true;
+        joy1_auto_read = encodeJoypadState(joy1_state);
+        joy2_auto_read = encodeJoypadState(joy2_state);
+        auto_joypad_busy = false;
+    }
     auto_joypad_busy = false;
 }
 
@@ -178,6 +218,11 @@ void Bus::stepHDMA() {
 void Bus::setJoypadState(uint16_t pad1, uint16_t pad2) {
     joy1_state = pad1;
     joy2_state = pad2;
+    joy1_auto_read = encodeJoypadState(joy1_state);
+    joy2_auto_read = encodeJoypadState(joy2_state);
+    if (joypad_strobe) {
+        latchJoypads();
+    }
 }
 
 void Bus::saveSRAM() {
@@ -210,8 +255,14 @@ uint8_t Bus::read(uint32_t address) {
             wram_address = (wram_address + 1) & 0x01FFFF;
             return val;
         }
-        if (offset == 0x4016) return 0x00;
-        if (offset == 0x4017) return 0x00;
+        if (offset == 0x4016) {
+            joy4016_reads++;
+            return (uint8_t)((open_bus & 0xFC) | readJoypadSerial(0));
+        }
+        if (offset == 0x4017) {
+            joy4017_reads++;
+            return (uint8_t)(0x1C | readJoypadSerial(1));
+        }
         if (offset == 0x4210) {
             const uint8_t value = (nmi_pending ? 0x80 : 0x00) | 0x02;
             nmi_pending = false;
@@ -231,10 +282,10 @@ uint8_t Bus::read(uint32_t address) {
         if (offset == 0x4215) return (rddiv >> 8) & 0xFF;
         if (offset == 0x4216) return rdmpy & 0xFF;
         if (offset == 0x4217) return (rdmpy >> 8) & 0xFF;
-        if (offset == 0x4218) return joy1_state & 0xFF;
-        if (offset == 0x4219) return (joy1_state >> 8) & 0xFF;
-        if (offset == 0x421A) return joy2_state & 0xFF;
-        if (offset == 0x421B) return (joy2_state >> 8) & 0xFF;
+        if (offset == 0x4218) { joy4218_reads++; return joy1_auto_read & 0xFF; }
+        if (offset == 0x4219) { joy4219_reads++; return (joy1_auto_read >> 8) & 0xFF; }
+        if (offset == 0x421A) { joy421A_reads++; return joy2_auto_read & 0xFF; }
+        if (offset == 0x421B) { joy421B_reads++; return (joy2_auto_read >> 8) & 0xFF; }
         if (offset >= 0x421C && offset <= 0x421F) return 0x00;
         if (offset >= 0x4300 && offset <= 0x437F) {
             uint8_t ch = (offset >> 4) & 0x07;
@@ -296,6 +347,16 @@ void Bus::write(uint32_t address, uint8_t data) {
             if ((data & 0x30) == 0) {
                 irq_pending = false;
             }
+            return;
+        }
+        if (offset == 0x4016) {
+            joy4016_writes++;
+            last_joy4016_write = data;
+            const bool new_strobe = (data & 0x01) != 0;
+            if (new_strobe || (joypad_strobe && !new_strobe)) {
+                latchJoypads();
+            }
+            joypad_strobe = new_strobe;
             return;
         }
         if (offset == 0x4207) { htime = (htime & 0x0100) | data; return; }

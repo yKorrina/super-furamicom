@@ -11,6 +11,7 @@ class APU {
 public:
     static constexpr int kOutputHz = 32000;
     static constexpr std::size_t kDebugAudioHistory = 8192;
+    static constexpr std::size_t kAudioFifoSamples = 8192;
 
     struct VoiceDebug {
         bool active = false;
@@ -20,11 +21,16 @@ public:
         bool pitch_mod_enabled = false;
         uint8_t source_number = 0;
         uint8_t adsr1 = 0;
+        uint8_t max_adsr1_written = 0;
         uint8_t adsr2 = 0;
         uint8_t gain = 0;
         uint16_t source_start = 0;
         uint16_t loop_start = 0;
         uint16_t next_block_addr = 0;
+        uint16_t interp_index = 0;
+        int sample_index = 0;
+        int decoded_sample_count = 0;
+        int16_t current_sample = 0;
         uint16_t pitch = 0;
         uint16_t envelope = 0;
         int16_t last_output = 0;
@@ -73,6 +79,7 @@ public:
     std::uint64_t getGeneratedAudioFrames() const { return generated_audio_frames; }
     std::uint64_t getNonZeroAudioFrames() const { return nonzero_audio_frames; }
     int getAudioPeakSample() const { return audio_peak_sample; }
+    std::size_t getQueuedAudioFrames() const;
     uint8_t getDSPAddress() const { return dsp_addr; }
     uint8_t getControlReg() const { return control_reg; }
     uint8_t getTestReg() const { return test_reg; }
@@ -122,6 +129,7 @@ private:
         int envelope_latch = 0;
         int16_t prev1 = 0;
         int16_t prev2 = 0;
+        int16_t current_sample = 0;
         int16_t last_output = 0;
         std::deque<int16_t> decoded_samples;
     };
@@ -149,12 +157,13 @@ private:
     std::array<uint8_t, 4> spc_to_cpu{};
     std::array<uint8_t, 0x80> dsp_regs{};
     std::array<std::uint64_t, 0x80> dsp_write_counts{};
+    std::array<uint8_t, 8> max_voice_adsr1_written{};
     std::array<Timer, 3> timers{};
     std::array<Voice, 8> voices{};
     std::array<int16_t, kDebugAudioHistory> recent_audio_mono{};
     std::array<int16_t, 8> echo_history_left{};
     std::array<int16_t, 8> echo_history_right{};
-    std::deque<int16_t> audio_fifo;
+    std::array<int16_t, kAudioFifoSamples> audio_fifo{};
     mutable std::mutex audio_mutex;
 
     uint16_t pc = 0xFFC0;
@@ -183,12 +192,17 @@ private:
     int audio_peak_sample = 0;
     std::uint64_t cpu_cycle_accumulator = 0;
     std::uint64_t dsp_sample_counter = 0;
+    bool dsp_key_poll_phase = false;
     int sample_cycle_accumulator = 0;
     int spc_cycle_budget = 0;
     std::size_t recent_audio_pos = 0;
     bool recent_audio_filled = false;
     std::size_t echo_history_pos = 0;
+    std::size_t audio_read_pos = 0;
+    std::size_t audio_write_pos = 0;
+    std::size_t audio_count = 0;
     int16_t noise_lfsr = 0x4000;
+    uint8_t pending_kon = 0;
     std::uint64_t key_on_count = 0;
     std::uint64_t key_off_count = 0;
     uint8_t last_key_on_mask = 0;
@@ -223,6 +237,7 @@ private:
     bool decodeNextBlock(int voice_index);
     void updateEnvelope(int voice_index);
     void updateNoise();
+    void pollKeyStates();
     bool shouldTickRate(uint8_t rate) const;
     int16_t renderVoice(int voice_index);
     int16_t readSample16(uint16_t address) const;

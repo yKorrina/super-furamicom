@@ -7,10 +7,15 @@
 #include "visualizer.hpp"
 #include <iostream>
 #include <fstream>
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -325,6 +330,7 @@ public:
             << " audio_frames=" << std::dec << apu.getGeneratedAudioFrames()
             << " audio_nonzero=" << apu.getNonZeroAudioFrames()
             << " audio_peak=" << apu.getAudioPeakSample()
+            << " audio_queue=" << apu.getQueuedAudioFrames()
             << " cpu_ports="
             << std::hex
             << (unsigned)cpu_ports[0] << "," << (unsigned)cpu_ports[1] << ","
@@ -355,6 +361,7 @@ public:
         }
         out << std::dec << "\n";
 
+        const uint8_t* aram = apu.getRAMData();
         const auto voices = apu.getVoiceDebug();
         for (int i = 0; i < 8; i++) {
             out << "[APU-V" << i << "] active=" << voices[i].active
@@ -362,11 +369,17 @@ public:
                 << " kon=" << voices[i].key_on_pending
                 << " src=$" << std::hex << (unsigned)voices[i].source_number
                 << " adsr1=$" << (unsigned)voices[i].adsr1
+                << " max_adsr1=$" << (unsigned)voices[i].max_adsr1_written
                 << " adsr2=$" << (unsigned)voices[i].adsr2
                 << " gain=$" << (unsigned)voices[i].gain
                 << " start=$" << voices[i].source_start
                 << " loop=$" << voices[i].loop_start
                 << " next=$" << voices[i].next_block_addr
+                << " interp=$" << voices[i].interp_index
+                << " sample_idx=" << std::dec << voices[i].sample_index
+                << " decoded=" << voices[i].decoded_sample_count
+                << " sample=" << voices[i].current_sample
+                << std::hex
                 << " pitch=$" << voices[i].pitch
                 << " env=$" << voices[i].envelope
                 << " out=" << std::dec << voices[i].last_output
@@ -377,6 +390,22 @@ public:
                 << " noise=" << voices[i].noise_enabled
                 << " pmon=" << voices[i].pitch_mod_enabled
                 << "\n";
+            if (voices[i].source_start != 0 || voices[i].next_block_addr != 0) {
+                const uint16_t start = voices[i].source_start;
+                const uint16_t loop = voices[i].loop_start;
+                const uint16_t next = voices[i].next_block_addr;
+                const uint16_t prev = (uint16_t)(next - 9);
+                out << "[APU-BRR" << i << "]"
+                    << " start_hdr=$" << std::hex << (unsigned)aram[start]
+                    << " start_b1=$" << (unsigned)aram[(uint16_t)(start + 1)]
+                    << " start_b2=$" << (unsigned)aram[(uint16_t)(start + 2)]
+                    << " loop_hdr=$" << (unsigned)aram[loop]
+                    << " prev_hdr=$" << (unsigned)aram[prev]
+                    << " next_hdr=$" << (unsigned)aram[next]
+                    << " next_b1=$" << (unsigned)aram[(uint16_t)(next + 1)]
+                    << " next_b2=$" << (unsigned)aram[(uint16_t)(next + 2)]
+                    << std::dec << "\n";
+            }
         }
 
         const auto timers = apu.getTimerDebug();
@@ -390,7 +419,6 @@ public:
                 << "\n";
         }
 
-        const uint8_t* aram = apu.getRAMData();
         const uint16_t spc_pc = apu.getSPCPC();
         out << "[APU-PC] pc=$" << std::hex << spc_pc << " bytes=";
         for (int i = 0; i < 8; i++) {
@@ -398,6 +426,21 @@ public:
             out << (i == 0 ? "" : " ") << (unsigned)aram[addr];
         }
         out << std::dec << "\n";
+
+        out << "[PAD] joy1_state=$" << std::hex << bus.getJoy1AutoRead()
+            << " joy2_state=$" << bus.getJoy2AutoRead()
+            << " joy1_shift=$" << bus.getJoy1Shift()
+            << " joy2_shift=$" << bus.getJoy2Shift()
+            << " strobe=" << std::dec << bus.getJoypadStrobe()
+            << " joy4016_reads=" << bus.getJoy4016Reads()
+            << " joy4017_reads=" << bus.getJoy4017Reads()
+            << " joy4218_reads=" << bus.getJoy4218Reads()
+            << " joy4219_reads=" << bus.getJoy4219Reads()
+            << " joy421A_reads=" << bus.getJoy421AReads()
+            << " joy421B_reads=" << bus.getJoy421BReads()
+            << " joy4016_writes=" << bus.getJoy4016Writes()
+            << " last_4016=$" << std::hex << (unsigned)bus.getLastJoy4016Write()
+            << std::dec << "\n";
     }
 
     ~System() { saveSRAM(); delete cartridge; }
@@ -498,6 +541,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+
     SDL_Window* window = SDL_CreateWindow("Super Furamicom",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         256*3, 224*3, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -507,8 +552,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
         std::cerr << "SDL_CreateRenderer failed: " << SDL_GetError() << "\n";
         SDL_DestroyWindow(window);
@@ -555,10 +600,11 @@ int main(int argc, char* argv[]) {
     }
 
     SDL_AudioSpec desired = {};
+    SDL_AudioSpec obtained = {};
     desired.freq = APU::kOutputHz; desired.format = AUDIO_S16SYS;
-    desired.channels = 2; desired.samples = 1024;
+    desired.channels = 2; desired.samples = 256;
     desired.callback = SDLAudioCallback; desired.userdata = snes.getAPU();
-    SDL_AudioDeviceID audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, NULL, 0);
+    SDL_AudioDeviceID audio_device = SDL_OpenAudioDevice(NULL, 0, &desired, &obtained, 0);
     if (audio_device) SDL_PauseAudioDevice(audio_device, 0);
 
     Visualizer* viz = nullptr;
@@ -578,6 +624,58 @@ int main(int argc, char* argv[]) {
     uint32_t frame_count = 0, last_fps_time = SDL_GetTicks();
     uint64_t perf_freq = SDL_GetPerformanceFrequency();
     const uint64_t target_ticks = perf_freq / 60;
+    bool reported_halt = false;
+
+    std::array<uint32_t, 256 * 224> present_frame{};
+    std::memcpy(present_frame.data(), snes.getFramebuffer(), present_frame.size() * sizeof(uint32_t));
+
+    std::mutex frame_mutex;
+    std::mutex system_mutex;
+    std::atomic<uint16_t> pending_pad1{0};
+    std::atomic<uint16_t> pending_pad2{0};
+    std::atomic<bool> emulation_running{true};
+    std::atomic<bool> cpu_halted{snes.isCPUHalted()};
+
+    std::thread emulation_thread([&]() {
+        using clock = std::chrono::steady_clock;
+        auto next_frame = clock::now();
+        const std::size_t callback_frames = audio_device
+            ? std::max<std::size_t>(128, obtained.samples != 0 ? obtained.samples : desired.samples)
+            : 256;
+        const std::size_t audio_frames_per_emu_frame = (APU::kOutputHz + 59) / 60;
+        const std::size_t kTargetQueuedAudioFrames = callback_frames + audio_frames_per_emu_frame;
+
+        while (emulation_running.load(std::memory_order_acquire)) {
+            const auto now = clock::now();
+            const bool behind_video = now >= next_frame;
+            const bool need_audio = snes.getAPU()->getQueuedAudioFrames() < kTargetQueuedAudioFrames;
+
+            if (!behind_video && !need_audio) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+
+            if (behind_video) {
+                next_frame += std::chrono::microseconds(16667);
+            }
+
+            if (!cpu_halted.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> system_lock(system_mutex);
+                snes.setJoypad(pending_pad1.load(std::memory_order_relaxed),
+                               pending_pad2.load(std::memory_order_relaxed));
+                snes.stepFrame();
+                cpu_halted.store(snes.isCPUHalted(), std::memory_order_relaxed);
+
+                const uint32_t* frame = snes.getFramebuffer();
+                std::lock_guard<std::mutex> frame_lock(frame_mutex);
+                std::memcpy(present_frame.data(), frame, present_frame.size() * sizeof(uint32_t));
+            }
+
+            if (next_frame + std::chrono::milliseconds(250) < now) {
+                next_frame = now;
+            }
+        }
+    });
 
     while (running) {
         uint64_t frame_start = SDL_GetPerformanceCounter();
@@ -629,15 +727,22 @@ int main(int argc, char* argv[]) {
         }
 
         const uint8_t* keys = SDL_GetKeyboardState(NULL);
-        snes.setJoypad(MapInputConfigToPad(keys, input_config));
-        snes.stepFrame();
+        pending_pad1.store(MapInputConfigToPad(keys, input_config), std::memory_order_relaxed);
 
-        SDL_UpdateTexture(texture, NULL, snes.getFramebuffer(), 256*sizeof(uint32_t));
+        {
+            std::lock_guard<std::mutex> frame_lock(frame_mutex);
+            SDL_UpdateTexture(texture, NULL, present_frame.data(), 256 * sizeof(uint32_t));
+        }
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, NULL, NULL);
         SDL_RenderPresent(renderer);
 
-        if (viz && viz->isOpen()) viz->update(snes.getCPU(), snes.getPPU(), *snes.getAPU());
+        if (viz && viz->isOpen()) {
+            std::unique_lock<std::mutex> system_lock(system_mutex, std::try_to_lock);
+            if (system_lock.owns_lock()) {
+                viz->update(snes.getCPU(), snes.getPPU(), *snes.getAPU());
+            }
+        }
 
         // Frame timing
         uint64_t elapsed = SDL_GetPerformanceCounter() - frame_start;
@@ -655,16 +760,14 @@ int main(int argc, char* argv[]) {
             frame_count = 0; last_fps_time = now;
         }
 
-        if (snes.isCPUHalted()) {
+        if (cpu_halted.load(std::memory_order_relaxed) && !reported_halt) {
+            reported_halt = true;
             std::cout << "[SYSTEM] CPU halted\n";
-            while (running) {
-                while (SDL_PollEvent(&event)) {
-                    if (event.type == SDL_QUIT || event.type == SDL_KEYDOWN) running = false;
-                }
-                SDL_Delay(100);
-            }
         }
     }
+
+    emulation_running.store(false, std::memory_order_release);
+    if (emulation_thread.joinable()) emulation_thread.join();
 
     if (viz) { viz->destroy(); delete viz; }
     SDL_DestroyTexture(texture);

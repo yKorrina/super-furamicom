@@ -56,8 +56,8 @@ bool Visualizer::init() {
         WIN_W, WIN_H, SDL_WINDOW_HIDDEN);
     if (!window) return false;
 
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     if (!renderer) {
         SDL_DestroyWindow(window);
         window = nullptr;
