@@ -2,10 +2,6 @@
 #include "bus.hpp"
 #include <cstdio>
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Construction / Reset
-// ─────────────────────────────────────────────────────────────────────────────
-
 CPU::CPU() : bus(nullptr), instruction_count(0), max_trace_lines(500000), trace_enabled(false) {
     A = X = Y = D = 0;
     SP = 0x01FF; PC = 0; PB = 0; DB = 0; P = 0x34; E = true;
@@ -50,10 +46,6 @@ void CPU::reset() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Execution
-// ─────────────────────────────────────────────────────────────────────────────
-
 uint8_t CPU::step() {
     if (halted) return 1;
     if (waiting_for_interrupt) return 1;
@@ -68,7 +60,6 @@ uint8_t CPU::step() {
     history_pos = (history_pos + 1) % kDebugHistory;
     history_filled = history_filled || history_pos == 0;
 
-    // ── Trace log ────────────────────────────────────────────────────────────
     if (trace_enabled && instruction_count < max_trace_lines) {
         const char* mnem = instruction_table[fetched_opcode].name;
         char buf[256];
@@ -78,7 +69,7 @@ uint8_t CPU::step() {
             PB, PC, fetched_opcode, mnem ? mnem : "???",
             A, X, Y, SP, P, D, DB, (int)E);
         log_file << buf << "\n";
-        
+
         if (instruction_count == max_trace_lines - 1) {
             log_file << "# TRACE LIMIT REACHED (" << max_trace_lines << " instructions)\n";
             log_file.flush();
@@ -126,10 +117,6 @@ void CPU::irq() {
     cycles_remaining += 7;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
 void     CPU::setFlag(uint8_t f, bool v)   { if (v) P |= f; else P &= ~f; }
 bool     CPU::getFlag(uint8_t f)           { return (P & f) != 0; }
 
@@ -138,14 +125,10 @@ uint16_t CPU::read16(uint32_t a)           { return (uint16_t)read8(a) | ((uint1
 void     CPU::write8 (uint32_t a, uint8_t  d) { if (bus) bus->write(a, d); }
 void     CPU::write16(uint32_t a, uint16_t d) { write8(a, d & 0xFF); write8(a + 1, d >> 8); }
 
-void    CPU::push8 (uint8_t  d) { write8(SP, d); SP--; if (E && (SP & 0xFF) == 0xFF) SP = (SP & 0xFF00) | 0xFF; /* wrap handled below */ if (E) SP = 0x0100 | (SP & 0xFF); }
+void    CPU::push8 (uint8_t  d) { write8(SP, d); SP--; if (E && (SP & 0xFF) == 0xFF) SP = (SP & 0xFF00) | 0xFF;  if (E) SP = 0x0100 | (SP & 0xFF); }
 void    CPU::push16(uint16_t d) { push8(d >> 8); push8(d & 0xFF); }
 uint8_t CPU::pop8 ()            { SP++; if (E) SP = 0x0100 | (SP & 0xFF); return read8(SP); }
 uint16_t CPU::pop16()           { uint8_t lo = pop8(); uint8_t hi = pop8(); return (uint16_t)lo | ((uint16_t)hi << 8); }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Addressing Modes
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::IMP()  {}
 void CPU::ACC()  {}
@@ -228,10 +211,6 @@ void CPU::SR_IND_Y() {
 void CPU::REL()   { effective_address = ((uint32_t)PB << 16) | PC; PC += 1; }
 void CPU::REL16() { effective_address = ((uint32_t)PB << 16) | PC; PC += 2; }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Load / Store
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::LDA() {
     if (getFlag(0x20)) {
         uint8_t v = read8(effective_address);
@@ -282,10 +261,6 @@ void CPU::STZ() {
     if (getFlag(0x20)) write8 (effective_address, 0);
     else               write16(effective_address, 0);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Arithmetic
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::ADC() {
     uint16_t val = getFlag(0x20) ? read8(effective_address) : read16(effective_address);
@@ -379,10 +354,6 @@ void CPU::DEY() {
     setFlag(0x02, Y == 0); setFlag(0x80, (Y & (getFlag(0x10) ? 0x80 : 0x8000)) != 0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Logic
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::AND() {
     uint16_t val = getFlag(0x20) ? read8(effective_address) : read16(effective_address);
     A = getFlag(0x20) ? (A & 0xFF00) | ((A & 0xFF) & val) : A & val;
@@ -435,10 +406,6 @@ void CPU::TRB() {
         write16(effective_address, data & ~A);
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Shifts & Rotates
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::ASL_A() {
     bool m8 = getFlag(0x20);
@@ -548,10 +515,6 @@ void CPU::ROR_M() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Compare
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::CMP() {
     uint16_t val = getFlag(0x20) ? read8(effective_address) : read16(effective_address);
     uint16_t reg = getFlag(0x20) ? A & 0xFF : A;
@@ -577,10 +540,6 @@ void CPU::CPY() {
     setFlag(0x80, (res & (getFlag(0x10) ? 0x80 : 0x8000)) != 0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Branches
-// ─────────────────────────────────────────────────────────────────────────────
-
 static inline uint16_t branch8(uint16_t PC, uint8_t rel) {
     return PC + (int8_t)rel;
 }
@@ -595,10 +554,6 @@ void CPU::BPL() { if (!getFlag(0x80)) { PC = branch8(PC, read8(effective_address
 void CPU::BMI() { if ( getFlag(0x80)) { PC = branch8(PC, read8(effective_address)); cycles_remaining++; } }
 void CPU::BVC() { if (!getFlag(0x40)) { PC = branch8(PC, read8(effective_address)); cycles_remaining++; } }
 void CPU::BVS() { if ( getFlag(0x40)) { PC = branch8(PC, read8(effective_address)); cycles_remaining++; } }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Jumps & Calls
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::JMP()     { PC = effective_address & 0xFFFF; }
 void CPU::JML()     { PB = (effective_address >> 16) & 0xFF; PC = effective_address & 0xFFFF; }
@@ -647,10 +602,6 @@ void CPU::RTI() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Stack
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::PHA() { if (getFlag(0x20)) push8(A & 0xFF); else push16(A); }
 void CPU::PLA() {
     if (getFlag(0x20)) { A = (A & 0xFF00) | pop8();  setFlag(0x02, (A&0xFF)==0);  setFlag(0x80, (A&0x80)!=0); }
@@ -685,10 +636,6 @@ void CPU::PLD() { D = pop16(); setFlag(0x02, D==0); setFlag(0x80, (D&0x8000)!=0)
 void CPU::PEA() { push16(read16(effective_address)); }
 void CPU::PEI() { push16(read16(effective_address)); }
 void CPU::PER() { push16(PC + (int16_t)read16(effective_address)); }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Transfers
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::TAX() {
     X = getFlag(0x10) ? A & 0xFF : A;
@@ -738,10 +685,6 @@ void CPU::XBA() {
     setFlag(0x80, (newLo & 0x80) != 0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Processor Control
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::SEI() { setFlag(0x04, true); }
 void CPU::CLC() { setFlag(0x01, false); }
 void CPU::SEC() { setFlag(0x01, true); }
@@ -786,15 +729,15 @@ void CPU::XCE() {
 void CPU::NOP() {}
 
 void CPU::BRK() {
-    PC++;  // BRK has a signature byte
+    PC++;
     if (!E) push8(PB);
     push16(PC);
     push8(P);
     setFlag(0x04, true);
     setFlag(0x08, false);
     PB = 0x00;
-    if (E)  PC = read16(0x00FFFE);  // Emulation BRK vector
-    else    PC = read16(0x00FFE6);  // Native BRK vector
+    if (E)  PC = read16(0x00FFFE);
+    else    PC = read16(0x00FFE6);
 }
 
 void CPU::STP() {
@@ -808,10 +751,6 @@ void CPU::STP() {
 void CPU::WAI() {
     waiting_for_interrupt = true;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Opcodes — Block Move
-// ─────────────────────────────────────────────────────────────────────────────
 
 void CPU::MVN() {
     uint8_t dest_bank = read8(((uint32_t)PB << 16) | PC++);
@@ -833,35 +772,27 @@ void CPU::MVP() {
     cycles_remaining = 7;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Instruction Table
-// ─────────────────────────────────────────────────────────────────────────────
-
 void CPU::buildInstructionTable() {
     for (int i = 0; i < 256; i++)
         instruction_table[i] = { &CPU::NOP, &CPU::IMP, 2, "NOP" };
 
-    // ── BRK / COP / WDM / STP / WAI ─────────────────────────────────────────
     instruction_table[0x00] = { &CPU::BRK, &CPU::IMP,  7, "BRK" };
-    instruction_table[0x02] = { &CPU::NOP, &CPU::IMM8, 2, "COP" };  // COP stub
-    instruction_table[0x42] = { &CPU::NOP, &CPU::IMM8, 2, "WDM" };  // WDM stub
+    instruction_table[0x02] = { &CPU::NOP, &CPU::IMM8, 2, "COP" };
+    instruction_table[0x42] = { &CPU::NOP, &CPU::IMM8, 2, "WDM" };
     instruction_table[0xCB] = { &CPU::WAI, &CPU::IMP,  3, "WAI" };
     instruction_table[0xDB] = { &CPU::STP, &CPU::IMP,  3, "STP" };
 
-    // ── BIT ──────────────────────────────────────────────────────────────────
     instruction_table[0x24] = { &CPU::BIT,  &CPU::DP,    3, "BIT" };
     instruction_table[0x2C] = { &CPU::BIT,  &CPU::ABS,   4, "BIT" };
     instruction_table[0x34] = { &CPU::BIT,  &CPU::DPX,   4, "BIT" };
     instruction_table[0x3C] = { &CPU::BIT,  &CPU::ABSX,  4, "BIT" };
     instruction_table[0x89] = { &CPU::BIT,  &CPU::IMM_M, 2, "BIT" };
 
-    // ── TSB / TRB ────────────────────────────────────────────────────────────
     instruction_table[0x04] = { &CPU::TSB,  &CPU::DP,    5, "TSB" };
     instruction_table[0x0C] = { &CPU::TSB,  &CPU::ABS,   6, "TSB" };
     instruction_table[0x14] = { &CPU::TRB,  &CPU::DP,    5, "TRB" };
     instruction_table[0x1C] = { &CPU::TRB,  &CPU::ABS,   6, "TRB" };
 
-    // ── ORA ──────────────────────────────────────────────────────────────────
     instruction_table[0x01] = { &CPU::ORA,  &CPU::DP_IND_X,      6, "ORA" };
     instruction_table[0x03] = { &CPU::ORA,  &CPU::SR,             4, "ORA" };
     instruction_table[0x05] = { &CPU::ORA,  &CPU::DP,             3, "ORA" };
@@ -878,7 +809,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x1D] = { &CPU::ORA,  &CPU::ABSX,           4, "ORA" };
     instruction_table[0x1F] = { &CPU::ORA,  &CPU::ALX,            5, "ORA" };
 
-    // ── AND ──────────────────────────────────────────────────────────────────
     instruction_table[0x21] = { &CPU::AND,  &CPU::DP_IND_X,      6, "AND" };
     instruction_table[0x23] = { &CPU::AND,  &CPU::SR,             4, "AND" };
     instruction_table[0x25] = { &CPU::AND,  &CPU::DP,             3, "AND" };
@@ -895,7 +825,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x3D] = { &CPU::AND,  &CPU::ABSX,           4, "AND" };
     instruction_table[0x3F] = { &CPU::AND,  &CPU::ALX,            5, "AND" };
 
-    // ── EOR ──────────────────────────────────────────────────────────────────
     instruction_table[0x41] = { &CPU::EOR,  &CPU::DP_IND_X,      6, "EOR" };
     instruction_table[0x43] = { &CPU::EOR,  &CPU::SR,             4, "EOR" };
     instruction_table[0x45] = { &CPU::EOR,  &CPU::DP,             3, "EOR" };
@@ -912,7 +841,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x5D] = { &CPU::EOR,  &CPU::ABSX,           4, "EOR" };
     instruction_table[0x5F] = { &CPU::EOR,  &CPU::ALX,            5, "EOR" };
 
-    // ── ADC ──────────────────────────────────────────────────────────────────
     instruction_table[0x61] = { &CPU::ADC,  &CPU::DP_IND_X,      6, "ADC" };
     instruction_table[0x63] = { &CPU::ADC,  &CPU::SR,             4, "ADC" };
     instruction_table[0x65] = { &CPU::ADC,  &CPU::DP,             3, "ADC" };
@@ -929,7 +857,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x7D] = { &CPU::ADC,  &CPU::ABSX,           4, "ADC" };
     instruction_table[0x7F] = { &CPU::ADC,  &CPU::ALX,            5, "ADC" };
 
-    // ── STA ──────────────────────────────────────────────────────────────────
     instruction_table[0x81] = { &CPU::STA,  &CPU::DP_IND_X,      6, "STA" };
     instruction_table[0x83] = { &CPU::STA,  &CPU::SR,             4, "STA" };
     instruction_table[0x85] = { &CPU::STA,  &CPU::DP,             3, "STA" };
@@ -945,7 +872,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x9D] = { &CPU::STA,  &CPU::ABSX,           5, "STA" };
     instruction_table[0x9F] = { &CPU::STA,  &CPU::ALX,            5, "STA" };
 
-    // ── LDA ──────────────────────────────────────────────────────────────────
     instruction_table[0xA1] = { &CPU::LDA,  &CPU::DP_IND_X,      6, "LDA" };
     instruction_table[0xA3] = { &CPU::LDA,  &CPU::SR,             4, "LDA" };
     instruction_table[0xA5] = { &CPU::LDA,  &CPU::DP,             3, "LDA" };
@@ -962,7 +888,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xBD] = { &CPU::LDA,  &CPU::ABSX,           4, "LDA" };
     instruction_table[0xBF] = { &CPU::LDA,  &CPU::ALX,            5, "LDA" };
 
-    // ── CMP ──────────────────────────────────────────────────────────────────
     instruction_table[0xC1] = { &CPU::CMP,  &CPU::DP_IND_X,      6, "CMP" };
     instruction_table[0xC3] = { &CPU::CMP,  &CPU::SR,             4, "CMP" };
     instruction_table[0xC5] = { &CPU::CMP,  &CPU::DP,             3, "CMP" };
@@ -979,7 +904,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xDD] = { &CPU::CMP,  &CPU::ABSX,           4, "CMP" };
     instruction_table[0xDF] = { &CPU::CMP,  &CPU::ALX,            5, "CMP" };
 
-    // ── SBC ──────────────────────────────────────────────────────────────────
     instruction_table[0xE1] = { &CPU::SBC,  &CPU::DP_IND_X,      6, "SBC" };
     instruction_table[0xE3] = { &CPU::SBC,  &CPU::SR,             4, "SBC" };
     instruction_table[0xE5] = { &CPU::SBC,  &CPU::DP,             3, "SBC" };
@@ -996,7 +920,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xFD] = { &CPU::SBC,  &CPU::ABSX,           4, "SBC" };
     instruction_table[0xFF] = { &CPU::SBC,  &CPU::ALX,            5, "SBC" };
 
-    // ── STX / STY / STZ ─────────────────────────────────────────────────────
     instruction_table[0x84] = { &CPU::STY,  &CPU::DP,   3, "STY" };
     instruction_table[0x86] = { &CPU::STX,  &CPU::DP,   3, "STX" };
     instruction_table[0x8C] = { &CPU::STY,  &CPU::ABS,  4, "STY" };
@@ -1008,7 +931,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x9C] = { &CPU::STZ,  &CPU::ABS,  4, "STZ" };
     instruction_table[0x9E] = { &CPU::STZ,  &CPU::ABSX, 5, "STZ" };
 
-    // ── LDX / LDY ────────────────────────────────────────────────────────────
     instruction_table[0xA0] = { &CPU::LDY,  &CPU::IMM_X, 2, "LDY" };
     instruction_table[0xA2] = { &CPU::LDX,  &CPU::IMM_X, 2, "LDX" };
     instruction_table[0xA4] = { &CPU::LDY,  &CPU::DP,    3, "LDY" };
@@ -1020,7 +942,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xBC] = { &CPU::LDY,  &CPU::ABSX,  4, "LDY" };
     instruction_table[0xBE] = { &CPU::LDX,  &CPU::ABSY,  4, "LDX" };
 
-    // ── CPX / CPY ────────────────────────────────────────────────────────────
     instruction_table[0xC0] = { &CPU::CPY,  &CPU::IMM_X, 2, "CPY" };
     instruction_table[0xC4] = { &CPU::CPY,  &CPU::DP,    3, "CPY" };
     instruction_table[0xCC] = { &CPU::CPY,  &CPU::ABS,   4, "CPY" };
@@ -1028,7 +949,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xE4] = { &CPU::CPX,  &CPU::DP,    3, "CPX" };
     instruction_table[0xEC] = { &CPU::CPX,  &CPU::ABS,   4, "CPX" };
 
-    // ── INC / DEC ────────────────────────────────────────────────────────────
     instruction_table[0x1A] = { &CPU::INA,  &CPU::IMP,  2, "INA" };
     instruction_table[0x3A] = { &CPU::DEA,  &CPU::IMP,  2, "DEA" };
     instruction_table[0xC6] = { &CPU::DEC,  &CPU::DP,   5, "DEC" };
@@ -1044,7 +964,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xCA] = { &CPU::DEX,  &CPU::IMP,  2, "DEX" };
     instruction_table[0xE8] = { &CPU::INX,  &CPU::IMP,  2, "INX" };
 
-    // ── ASL / LSR ────────────────────────────────────────────────────────────
     instruction_table[0x06] = { &CPU::ASL_M, &CPU::DP,   5, "ASL" };
     instruction_table[0x0A] = { &CPU::ASL_A, &CPU::ACC,  2, "ASL" };
     instruction_table[0x0E] = { &CPU::ASL_M, &CPU::ABS,  6, "ASL" };
@@ -1056,7 +975,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x56] = { &CPU::LSR_M, &CPU::DPX,  6, "LSR" };
     instruction_table[0x5E] = { &CPU::LSR_M, &CPU::ABSX, 7, "LSR" };
 
-    // ── ROL / ROR ────────────────────────────────────────────────────────────
     instruction_table[0x26] = { &CPU::ROL_M, &CPU::DP,   5, "ROL" };
     instruction_table[0x2A] = { &CPU::ROL_A, &CPU::ACC,  2, "ROL" };
     instruction_table[0x2E] = { &CPU::ROL_M, &CPU::ABS,  6, "ROL" };
@@ -1068,7 +986,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x76] = { &CPU::ROR_M, &CPU::DPX,  6, "ROR" };
     instruction_table[0x7E] = { &CPU::ROR_M, &CPU::ABSX, 7, "ROR" };
 
-    // ── Branches ─────────────────────────────────────────────────────────────
     instruction_table[0x10] = { &CPU::BPL,  &CPU::REL,   2, "BPL" };
     instruction_table[0x30] = { &CPU::BMI,  &CPU::REL,   2, "BMI" };
     instruction_table[0x50] = { &CPU::BVC,  &CPU::REL,   2, "BVC" };
@@ -1080,14 +997,12 @@ void CPU::buildInstructionTable() {
     instruction_table[0xD0] = { &CPU::BNE,  &CPU::REL,   2, "BNE" };
     instruction_table[0xF0] = { &CPU::BEQ,  &CPU::REL,   2, "BEQ" };
 
-    // ── Jumps ────────────────────────────────────────────────────────────────
     instruction_table[0x4C] = { &CPU::JMP,     &CPU::ABS,  3, "JMP" };
     instruction_table[0x5C] = { &CPU::JML,     &CPU::AL,   4, "JML" };
     instruction_table[0x6C] = { &CPU::JMP_IND, &CPU::IMP,  5, "JMP" };
     instruction_table[0x7C] = { &CPU::JMP_IND_X, &CPU::IMP, 6, "JMP" };
     instruction_table[0xDC] = { &CPU::JML_IND, &CPU::IMP,  6, "JML" };
 
-    // ── Calls / Returns ──────────────────────────────────────────────────────
     instruction_table[0x20] = { &CPU::JSR,     &CPU::ABS,  6, "JSR" };
     instruction_table[0x22] = { &CPU::JSL,     &CPU::AL,   8, "JSL" };
     instruction_table[0x40] = { &CPU::RTI,     &CPU::IMP,  6, "RTI" };
@@ -1095,7 +1010,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x6B] = { &CPU::RTL,     &CPU::IMP,  6, "RTL" };
     instruction_table[0xFC] = { &CPU::JSR_IND_X, &CPU::IMP, 8, "JSR" };
 
-    // ── Stack ────────────────────────────────────────────────────────────────
     instruction_table[0x08] = { &CPU::PHP, &CPU::IMP, 3, "PHP" };
     instruction_table[0x28] = { &CPU::PLP, &CPU::IMP, 4, "PLP" };
     instruction_table[0x48] = { &CPU::PHA, &CPU::IMP, 3, "PHA" };
@@ -1113,7 +1027,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0xD4] = { &CPU::PEI, &CPU::DP,    6, "PEI" };
     instruction_table[0x62] = { &CPU::PER, &CPU::IMM16, 6, "PER" };
 
-    // ── Transfers ────────────────────────────────────────────────────────────
     instruction_table[0xAA] = { &CPU::TAX, &CPU::IMP, 2, "TAX" };
     instruction_table[0xA8] = { &CPU::TAY, &CPU::IMP, 2, "TAY" };
     instruction_table[0x8A] = { &CPU::TXA, &CPU::IMP, 2, "TXA" };
@@ -1128,7 +1041,6 @@ void CPU::buildInstructionTable() {
     instruction_table[0x3B] = { &CPU::TSC, &CPU::IMP, 2, "TSC" };
     instruction_table[0xEB] = { &CPU::XBA, &CPU::IMP, 3, "XBA" };
 
-    // ── Processor Control ────────────────────────────────────────────────────
     instruction_table[0x18] = { &CPU::CLC, &CPU::IMP, 2, "CLC" };
     instruction_table[0x38] = { &CPU::SEC, &CPU::IMP, 2, "SEC" };
     instruction_table[0x58] = { &CPU::CLI, &CPU::IMP, 2, "CLI" };
@@ -1140,10 +1052,8 @@ void CPU::buildInstructionTable() {
     instruction_table[0xE2] = { &CPU::SEP, &CPU::IMM8, 3, "SEP" };
     instruction_table[0xFB] = { &CPU::XCE, &CPU::IMP,  2, "XCE" };
 
-    // ── NOP / Misc ───────────────────────────────────────────────────────────
     instruction_table[0xEA] = { &CPU::NOP, &CPU::IMP, 2, "NOP" };
 
-    // ── Block Move ───────────────────────────────────────────────────────────
     instruction_table[0x44] = { &CPU::MVP, &CPU::IMP, 7, "MVP" };
     instruction_table[0x54] = { &CPU::MVN, &CPU::IMP, 7, "MVN" };
 }

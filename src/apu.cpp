@@ -1,15 +1,17 @@
 #include "apu.hpp"
+#include "timing.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace {
-constexpr int kCpuCyclesPerSecond = 29781 * 60;
 constexpr int kSpcCyclesPerSecond = 1024000;
 constexpr int kSpcCyclesPerSample = 32;
-constexpr std::size_t kMaxQueuedFrames = 2048;
+constexpr int kSimpleCounterRange = 2048 * 5 * 3;
+constexpr std::size_t kMaxQueuedFrames = 4096;
 constexpr std::size_t kMaxQueuedSamples = kMaxQueuedFrames * 2;
 constexpr double kPi = 3.14159265358979323846;
 constexpr std::array<int, 32> kCounterRates = {
@@ -38,12 +40,69 @@ inline int clamp11(int value) {
     return std::clamp(value, 0, 0x07FF);
 }
 
+inline int clip15(int value) {
+    return std::clamp(value, -0x4000, 0x3FFF);
+}
+
+inline int decodeBrrSample(int nibble, uint8_t range, uint8_t filter, int prev1, int prev2) {
+    int sample = nibble;
+    if (range <= 12) {
+        sample = (sample << range) >> 1;
+    } else {
+        sample &= ~0x07FF;
+    }
+
+    const int p1 = prev1;
+    const int p2 = prev2 >> 1;
+    switch (filter) {
+    case 1:
+        sample += p1 >> 1;
+        sample += (-p1) >> 5;
+        break;
+    case 2:
+        sample += p1;
+        sample -= p2;
+        sample += p2 >> 4;
+        sample += (p1 * -3) >> 6;
+        break;
+    case 3:
+        sample += p1;
+        sample -= p2;
+        sample += (p1 * -13) >> 7;
+        sample += (p2 * 3) >> 4;
+        break;
+    default:
+        break;
+    }
+
+    sample = clamp16(sample);
+    return (int16_t)(sample * 2);
+}
+
 inline int16_t signExtend15(uint16_t value) {
     return (value & 0x4000) != 0 ? (int16_t)(value | 0x8000) : (int16_t)value;
 }
 
 inline int clampIndex(int value, int lo, int hi) {
     return std::max(lo, std::min(value, hi));
+}
+
+inline int counterOffset(uint8_t rate) {
+    if (rate == 0) {
+        return 1;
+    }
+    if (rate >= 30) {
+        return 0;
+    }
+
+    switch ((rate - 1) % 3) {
+    case 1:
+        return 1040;
+    case 2:
+        return 536;
+    default:
+        return 0;
+    }
 }
 
 std::array<int16_t, 512> BuildGaussianTable() {
@@ -84,6 +143,20 @@ APU::APU() {
     reset();
 }
 
+void APU::configureWriteWatch(uint16_t start, uint16_t length) {
+    write_watch_enabled = length != 0;
+    write_watch_start = start;
+    write_watch_length = length;
+    watched_write_history.fill(WatchedWriteDebug{});
+    watched_write_history_pos = 0;
+    watched_write_history_filled = false;
+    watched_write_sequence = 0;
+}
+
+void APU::clearWriteWatch() {
+    configureWriteWatch(0, 0);
+}
+
 std::array<APU::VoiceDebug, 8> APU::getVoiceDebug() const {
     std::array<VoiceDebug, 8> info{};
     for (int voice_index = 0; voice_index < 8; voice_index++) {
@@ -105,7 +178,16 @@ std::array<APU::VoiceDebug, 8> APU::getVoiceDebug() const {
         out.next_block_addr = voice.next_block_addr;
         out.interp_index = voice.interp_index;
         out.sample_index = voice.sample_index;
-        out.decoded_sample_count = (int)voice.decoded_samples.size();
+        out.decoded_sample_count = (int)voice.sample_ring.size();
+        auto sampleAt = [&voice](int index) -> int16_t {
+            if (voice.sample_ring.empty()) return 0;
+            index = clampIndex(index, 0, voice.sample_ring.size() - 1);
+            return voice.sample_ring[index];
+        };
+        out.tap_prev2 = sampleAt(voice.sample_index - 2);
+        out.tap_prev1 = sampleAt(voice.sample_index - 1);
+        out.tap_curr = sampleAt(voice.sample_index + 0);
+        out.tap_next = sampleAt(voice.sample_index + 1);
         out.current_sample = voice.current_sample;
         out.pitch = (uint16_t)dsp_regs[base + 2] | ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8);
         out.envelope = voice.envelope;
@@ -131,6 +213,16 @@ std::array<APU::TimerDebug, 3> APU::getTimerDebug() const {
     return info;
 }
 
+int APU::getActiveVoiceCount() const {
+    int active = 0;
+    for (const Voice& voice : voices) {
+        if (voice.active || voice.key_on_pending) {
+            active++;
+        }
+    }
+    return active;
+}
+
 std::size_t APU::getQueuedAudioFrames() const {
     std::lock_guard<std::mutex> lock(audio_mutex);
     return audio_count / 2;
@@ -141,6 +233,7 @@ void APU::reset() {
     cpu_to_spc.fill(0);
     spc_to_cpu.fill(0);
     dsp_regs.fill(0);
+    dsp_read_counts.fill(0);
     dsp_write_counts.fill(0);
     max_voice_adsr1_written.fill(0);
     voices.fill(Voice{});
@@ -154,6 +247,7 @@ void APU::reset() {
         audio_write_pos = 0;
         audio_count = 0;
     }
+    audio_staging.fill(0);
 
     timers[0] = Timer{};
     timers[1] = Timer{};
@@ -183,19 +277,53 @@ void APU::reset() {
     execute_address = 0;
     unsupported_op = 0;
     unsupported_pc = 0;
+    current_instruction_pc = 0;
+    current_instruction_opcode = 0;
+    instruction_pc_history.fill(0);
+    instruction_opcode_history.fill(0);
+    instruction_a_history.fill(0);
+    instruction_x_history.fill(0);
+    instruction_y_history.fill(0);
+    directory_write_history.fill(DirectoryWriteDebug{});
+    watched_write_history.fill(WatchedWriteDebug{});
+    instruction_history_pos = 0;
+    instruction_history_filled = false;
+    directory_write_history_pos = 0;
+    directory_write_history_filled = false;
+    directory_write_sequence = 0;
+    watched_write_history_pos = 0;
+    watched_write_history_filled = false;
+    watched_write_sequence = 0;
+    write_watch_enabled = false;
+    write_watch_start = 0;
+    write_watch_length = 0;
     generated_audio_frames = 0;
     nonzero_audio_frames = 0;
+    silent_audio_frames = 0;
+    blank_loop_fallbacks = 0;
     audio_peak_sample = 0;
+    audio_peak_queued_frames = 0;
+    audio_underrun_frames = 0;
+    audio_dropped_frames = 0;
     cpu_cycle_accumulator = 0;
     dsp_sample_counter = 0;
-    dsp_key_poll_phase = false;
+    dsp_counter = 0;
+    dsp_key_poll_phase = true;
     sample_cycle_accumulator = 0;
     spc_cycle_budget = 0;
     recent_audio_pos = 0;
     recent_audio_filled = false;
     echo_history_pos = 0;
+    audio_staging_count = 0;
     noise_lfsr = 0x4000;
+    last_mixed_left = 0;
+    last_mixed_right = 0;
+    playback_hold_left = 0;
+    playback_hold_right = 0;
     pending_kon = 0;
+    pending_koff = 0;
+    latched_kon = 0;
+    voice_enable_mask = 0xFF;
     key_on_count = 0;
     key_off_count = 0;
     last_key_on_mask = 0;
@@ -204,11 +332,11 @@ void APU::reset() {
     spc_port_write_counts.fill(0);
     last_cpu_port_writes.fill(0);
     last_spc_port_writes.fill(0);
+    pending_cpu_port_write_count = 0;
 
     dsp_regs[0x6C] = 0xE0;
     dsp_regs[0x7C] = 0x00;
 
-    // Let the IPL ROM perform its power-on init so the CPU sees $AA/$BB.
     runCycles(4096);
 }
 
@@ -218,36 +346,49 @@ uint8_t APU::readPort(uint8_t port) const {
 
 void APU::writePort(uint8_t port, uint8_t data) {
     const std::size_t index = port & 0x03;
-    cpu_to_spc[index] = data;
     cpu_port_write_counts[index]++;
     last_cpu_port_writes[index] = data;
+    commitCpuPortWrite((uint8_t)index, data);
 }
 
 void APU::tickCPUCycles(int cpu_cycles) {
     if (cpu_cycles <= 0) return;
 
-    cpu_cycle_accumulator += (std::uint64_t)cpu_cycles * kSpcCyclesPerSecond;
-    int spc_cycles = (int)(cpu_cycle_accumulator / kCpuCyclesPerSecond);
-    cpu_cycle_accumulator %= kCpuCyclesPerSecond;
-    runCycles(spc_cycles);
+    auto advanceCpuCycles = [this](int cycles) {
+        if (cycles <= 0) return;
+        cpu_cycle_accumulator += (std::uint64_t)cycles * kSpcCyclesPerSecond;
+        int spc_cycles = (int)(cpu_cycle_accumulator / EmuTiming::kCpuCyclesPerSecond);
+        cpu_cycle_accumulator %= EmuTiming::kCpuCyclesPerSecond;
+        runCycles(spc_cycles);
+    };
+
+    pending_cpu_port_write_count = 0;
+    advanceCpuCycles(cpu_cycles);
+    flushQueuedAudio();
 }
 
 void APU::endFrame() {
-    // No frame-boundary work yet. The APU now advances from CPU timing instead.
+    flushQueuedAudio();
 }
 
 void APU::mix(int16_t* stream, int stereo_frames) {
     if (!stream || stereo_frames <= 0) return;
 
     std::lock_guard<std::mutex> lock(audio_mutex);
-    const int sample_count = stereo_frames * 2;
-    for (int i = 0; i < sample_count; i++) {
-        if (audio_count != 0) {
-            stream[i] = audio_fifo[audio_read_pos];
+    for (int frame = 0; frame < stereo_frames; frame++) {
+        const int sample_index = frame * 2;
+        if (audio_count >= 2) {
+            stream[sample_index + 0] = audio_fifo[audio_read_pos];
             audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
-            audio_count--;
+            stream[sample_index + 1] = audio_fifo[audio_read_pos];
+            audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
+            audio_count -= 2;
+            playback_hold_left = stream[sample_index + 0];
+            playback_hold_right = stream[sample_index + 1];
         } else {
-            stream[i] = 0;
+            stream[sample_index + 0] = playback_hold_left;
+            stream[sample_index + 1] = playback_hold_right;
+            audio_underrun_frames++;
         }
     }
 }
@@ -287,7 +428,18 @@ uint8_t APU::readMem(uint16_t address) {
     case 0x00F0: return 0x00;
     case 0x00F1: return 0x00;
     case 0x00F2: return dsp_addr;
-    case 0x00F3: return dsp_regs[dsp_addr & 0x7F];
+    case 0x00F3: {
+        const uint8_t reg = dsp_addr & 0x7F;
+        dsp_read_counts[reg]++;
+        if (reg == 0x4C || reg == 0x5C) {
+            return 0x00;
+        }
+        const uint8_t value = dsp_regs[reg];
+        if (reg == 0x7C) {
+            dsp_regs[reg] = 0x00;
+        }
+        return value;
+    }
     case 0x00F4:
     case 0x00F5:
     case 0x00F6:
@@ -296,7 +448,7 @@ uint8_t APU::readMem(uint16_t address) {
     case 0x00FA:
     case 0x00FB:
     case 0x00FC:
-        return 0x00;
+        return ram[address];
     case 0x00FD:
     case 0x00FE:
     case 0x00FF: {
@@ -318,6 +470,10 @@ void APU::updateDriverReadyState() {
                    spc_to_cpu[3] == 0x00;
 }
 
+void APU::commitCpuPortWrite(uint8_t port, uint8_t data) {
+    cpu_to_spc[port & 0x03] = data;
+}
+
 void APU::writeDSP(uint8_t reg, uint8_t value) {
     reg &= 0x7F;
     dsp_write_counts[reg]++;
@@ -332,13 +488,14 @@ void APU::writeDSP(uint8_t reg, uint8_t value) {
     }
     switch (reg) {
     case 0x4C:
+        pending_kon |= value;
         if (value != 0) {
             key_on_count++;
             last_key_on_mask = value;
-            pending_kon |= value;
         }
         break;
     case 0x5C:
+        pending_koff |= value;
         if (value != 0) {
             key_off_count++;
             last_key_off_mask = value;
@@ -358,6 +515,19 @@ void APU::writeDSP(uint8_t reg, uint8_t value) {
 }
 
 void APU::writeMem(uint16_t address, uint8_t data) {
+    const uint8_t before = ram[address];
+    const uint32_t directory_base = (uint32_t)(dsp_regs[0x5D] << 8);
+    const uint32_t directory_offset = ((uint32_t)address - directory_base) & 0xFFFFu;
+    const bool is_directory_write = directory_offset < 0x0400u;
+    if (is_directory_write && before != data) {
+        recordDirectoryWrite(address, before, data);
+    }
+    if (write_watch_enabled && before != data) {
+        const uint32_t watch_offset = ((uint32_t)address - write_watch_start) & 0xFFFFu;
+        if (watch_offset < write_watch_length) {
+            recordWatchedWrite(address, before, data);
+        }
+    }
     ram[address] = data;
 
     switch (address) {
@@ -418,6 +588,42 @@ void APU::writeMem(uint16_t address, uint8_t data) {
     default:
         break;
     }
+}
+
+void APU::recordDirectoryWrite(uint16_t address, uint8_t before, uint8_t value) {
+    DirectoryWriteDebug& entry = directory_write_history[directory_write_history_pos];
+    entry.sequence = ++directory_write_sequence;
+    entry.pc = current_instruction_pc;
+    entry.opcode = current_instruction_opcode;
+    entry.a = a;
+    entry.x = x;
+    entry.y = y;
+    entry.psw = psw;
+    entry.address = address;
+    entry.before = before;
+    entry.value = value;
+    directory_write_history_pos =
+        (directory_write_history_pos + 1) % directory_write_history.size();
+    directory_write_history_filled =
+        directory_write_history_filled || directory_write_history_pos == 0;
+}
+
+void APU::recordWatchedWrite(uint16_t address, uint8_t before, uint8_t value) {
+    WatchedWriteDebug& entry = watched_write_history[watched_write_history_pos];
+    entry.sequence = ++watched_write_sequence;
+    entry.pc = current_instruction_pc;
+    entry.opcode = current_instruction_opcode;
+    entry.a = a;
+    entry.x = x;
+    entry.y = y;
+    entry.psw = psw;
+    entry.address = address;
+    entry.before = before;
+    entry.value = value;
+    watched_write_history_pos =
+        (watched_write_history_pos + 1) % watched_write_history.size();
+    watched_write_history_filled =
+        watched_write_history_filled || watched_write_history_pos == 0;
 }
 
 uint8_t APU::fetchByte() {
@@ -489,6 +695,8 @@ void APU::queueSample(int16_t left, int16_t right) {
     generated_audio_frames++;
     if (left != 0 || right != 0) {
         nonzero_audio_frames++;
+    } else {
+        silent_audio_frames++;
     }
     audio_peak_sample = std::max(audio_peak_sample,
                                  std::max(std::abs((int)left), std::abs((int)right)));
@@ -499,26 +707,44 @@ void APU::queueSample(int16_t left, int16_t right) {
         recent_audio_filled = true;
     }
 
+    if (audio_staging_count + 2 > audio_staging.size()) {
+        flushQueuedAudio();
+    }
+    audio_staging[audio_staging_count++] = left;
+    audio_staging[audio_staging_count++] = right;
+}
+
+void APU::flushQueuedAudio() {
+    if (audio_staging_count == 0) {
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(audio_mutex);
-    while (audio_count + 2 > kMaxQueuedSamples) {
+    while (audio_count + audio_staging_count > kMaxQueuedSamples) {
         audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
         audio_read_pos = (audio_read_pos + 1) % audio_fifo.size();
         audio_count -= 2;
+        audio_dropped_frames++;
     }
-    audio_fifo[audio_write_pos] = left;
-    audio_write_pos = (audio_write_pos + 1) % audio_fifo.size();
-    audio_fifo[audio_write_pos] = right;
-    audio_write_pos = (audio_write_pos + 1) % audio_fifo.size();
-    audio_count += 2;
+    for (std::size_t i = 0; i < audio_staging_count; i++) {
+        audio_fifo[audio_write_pos] = audio_staging[i];
+        audio_write_pos = (audio_write_pos + 1) % audio_fifo.size();
+    }
+    audio_count += audio_staging_count;
+    audio_staging_count = 0;
+    audio_peak_queued_frames = std::max(audio_peak_queued_frames, audio_count / 2);
 }
 
 bool APU::shouldTickRate(uint8_t rate) const {
     rate &= 0x1F;
-    if (rate == 0) return false;
-
     const int period = kCounterRates[rate];
-    if (period <= 1) return true;
-    return (dsp_sample_counter % (std::uint64_t)period) == 0;
+    if (period <= 0) {
+        return false;
+    }
+    if (period <= 1) {
+        return true;
+    }
+    return ((dsp_counter + counterOffset(rate)) % period) == 0;
 }
 
 void APU::updateNoise() {
@@ -546,6 +772,7 @@ void APU::updateEnvelope(int voice_index) {
     if (voice.releasing || (dsp_regs[0x6C] & 0x80) != 0) {
         voice.envelope_mode = EnvelopeMode::Release;
         voice.envelope = voice.envelope > 8 ? (uint16_t)(voice.envelope - 8) : 0;
+        voice.hidden_envelope = voice.envelope;
         if (voice.envelope == 0) {
             voice.active = false;
         }
@@ -562,39 +789,42 @@ void APU::updateEnvelope(int voice_index) {
         switch (voice.envelope_mode) {
         case EnvelopeMode::Attack: {
             const uint8_t rate = (uint8_t)(((adsr1 & 0x0F) << 1) + 1);
+            int envelope = voice.envelope;
             if (shouldTickRate(rate)) {
                 const int step = (adsr1 & 0x0F) == 0x0F ? 1024 : 32;
-                voice.envelope = (uint16_t)clamp11((int)voice.envelope + step);
+                envelope += step;
             }
-            if (voice.envelope >= 0x07FF) {
-                voice.envelope = 0x07FF;
+            voice.hidden_envelope = envelope;
+            if ((unsigned)envelope > 0x07FF) {
+                envelope = 0x07FF;
                 voice.envelope_mode = EnvelopeMode::Decay;
             }
+            voice.envelope = (uint16_t)clamp11(envelope);
             break;
         }
         case EnvelopeMode::Decay: {
             const uint8_t rate = (uint8_t)((((adsr1 >> 4) & 0x07) << 1) + 16);
+            int envelope = voice.envelope;
             if (shouldTickRate(rate)) {
-                int envelope = voice.envelope;
                 envelope -= 1;
                 envelope -= envelope >> 8;
-                voice.envelope = (uint16_t)clamp11(envelope);
             }
-            const uint16_t sustain_level =
-                (uint16_t)std::min(0x07FF, (((adsr2 >> 5) & 0x07) + 1) << 8);
-            if (voice.envelope <= sustain_level) {
+            voice.hidden_envelope = envelope;
+            voice.envelope = (uint16_t)clamp11(envelope);
+            if ((voice.envelope >> 8) == (adsr2 >> 5)) {
                 voice.envelope_mode = EnvelopeMode::Sustain;
             }
             break;
         }
         case EnvelopeMode::Sustain: {
             const uint8_t rate = adsr2 & 0x1F;
+            int envelope = voice.envelope;
             if (shouldTickRate(rate)) {
-                int envelope = voice.envelope;
                 envelope -= 1;
                 envelope -= envelope >> 8;
-                voice.envelope = (uint16_t)clamp11(envelope);
             }
+            voice.hidden_envelope = envelope;
+            voice.envelope = (uint16_t)clamp11(envelope);
             break;
         }
         default:
@@ -607,6 +837,7 @@ void APU::updateEnvelope(int voice_index) {
     if ((gain & 0x80) == 0) {
         voice.envelope_mode = EnvelopeMode::Direct;
         voice.envelope = (uint16_t)clamp11((gain & 0x7F) << 4);
+        voice.hidden_envelope = voice.envelope;
         return;
     }
 
@@ -626,9 +857,10 @@ void APU::updateEnvelope(int voice_index) {
         envelope += 32;
         break;
     case 3:
-        envelope += envelope < 0x0600 ? 32 : 8;
+        envelope += voice.hidden_envelope < 0x0600 ? 32 : 8;
         break;
     }
+    voice.hidden_envelope = envelope;
     voice.envelope = (uint16_t)clamp11(envelope);
 }
 
@@ -642,6 +874,8 @@ void APU::keyOn(uint8_t voice_mask) {
             voice.kon_delay = 5;
 
             const int base = voice_index << 4;
+            voice.latched_source_number = dsp_regs[base + 4];
+            voice.source_number = voice.latched_source_number;
             dsp_regs[0x7C] &= (uint8_t)~(1u << voice_index);
             dsp_regs[base + 8] = 0;
             dsp_regs[base + 9] = 0;
@@ -659,25 +893,35 @@ void APU::keyOff(uint8_t voice_mask) {
 }
 
 void APU::pollKeyStates() {
-    const uint8_t koff = dsp_regs[0x5C];
+    dsp_key_poll_phase = !dsp_key_poll_phase;
+    if (!dsp_key_poll_phase) {
+        return;
+    }
+
+    pending_kon = (uint8_t)(pending_kon & (uint8_t)~latched_kon);
+    const uint8_t koff = pending_koff;
     const uint8_t kon = pending_kon;
+    pending_koff = 0;
+    pending_kon = 0;
+    latched_kon = kon;
 
     if (koff != 0) {
         keyOff(koff);
     }
     if (kon != 0) {
         keyOn(kon);
-        pending_kon = 0;
     }
 }
 
 void APU::resetVoice(int voice_index) {
     Voice& voice = voices[voice_index];
+    const uint8_t latched_source_number = voice.latched_source_number;
     voice = Voice{};
+    voice.latched_source_number = latched_source_number;
 
     const int base = voice_index << 4;
     const uint16_t directory_base = (uint16_t)(dsp_regs[0x5D] << 8);
-    const uint8_t source_number = dsp_regs[base + 4];
+    const uint8_t source_number = voice.latched_source_number;
     const uint16_t entry_addr = (uint16_t)(directory_base + source_number * 4);
     const uint16_t source_start =
         (uint16_t)ram[entry_addr] | ((uint16_t)ram[(uint16_t)(entry_addr + 1)] << 8);
@@ -713,17 +957,23 @@ void APU::resetVoice(int voice_index) {
 
     if (!decodeNextBlock(voice_index)) {
         voice.active = false;
-    } else if (!voice.decoded_samples.empty()) {
-        voice.decoded_samples.push_front(0);
-        voice.decoded_samples.push_front(0);
-        voice.decoded_samples.push_front(0);
-        voice.sample_index = std::min(3, (int)voice.decoded_samples.size() - 1);
+    } else if (!voice.sample_ring.empty()) {
+        voice.sample_ring.push_front(0);
+        voice.sample_ring.push_front(0);
+        voice.sample_ring.push_front(0);
+        voice.sample_index = std::min(3, (int)voice.sample_ring.size() - 1);
     }
 }
 
 bool APU::decodeNextBlock(int voice_index) {
     Voice& voice = voices[voice_index];
     if (!voice.active) return false;
+
+    if (voice.reset_predictor_on_next_block) {
+        voice.prev1 = 0;
+        voice.prev2 = 0;
+        voice.reset_predictor_on_next_block = false;
+    }
 
     const uint16_t block_addr = voice.next_block_addr;
     const uint8_t header = ram[block_addr];
@@ -732,41 +982,46 @@ bool APU::decodeNextBlock(int voice_index) {
     const bool loop = (header & 0x02) != 0;
     const bool end = (header & 0x01) != 0;
 
+    const uint16_t directory_base = (uint16_t)(dsp_regs[0x5D] << 8);
+    const uint16_t entry_addr = (uint16_t)(directory_base + voice.source_number * 4);
+    voice.loop_start =
+        (uint16_t)ram[(uint16_t)(entry_addr + 2)] |
+        ((uint16_t)ram[(uint16_t)(entry_addr + 3)] << 8);
+
     for (int i = 0; i < 16; i++) {
         const uint8_t packed = ram[(uint16_t)(block_addr + 1 + (i >> 1))];
         int nibble = ((i & 1) == 0) ? (packed >> 4) : (packed & 0x0F);
         if (nibble & 0x08) nibble -= 16;
-
-        int sample = (range <= 12) ? ((nibble << range) >> 1)
-                                   : (nibble < 0 ? -2048 : 0);
-
-        switch (filter) {
-        case 1:
-            sample += voice.prev1 + ((-voice.prev1) >> 4);
-            break;
-        case 2:
-            sample += (voice.prev1 << 1) +
-                      ((-((voice.prev1 << 1) + voice.prev1)) >> 5) -
-                      voice.prev2 + (voice.prev2 >> 4);
-            break;
-        case 3:
-            sample += (voice.prev1 << 1) +
-                      ((-(voice.prev1 + (voice.prev1 << 2) + (voice.prev1 << 3))) >> 6) -
-                      voice.prev2 + (((voice.prev2 << 1) + voice.prev2) >> 4);
-            break;
-        default:
-            break;
-        }
-
-        sample = clamp16(sample) & ~1;
+        const int sample = decodeBrrSample(nibble, range, filter, voice.prev1, voice.prev2);
         voice.prev2 = voice.prev1;
         voice.prev1 = (int16_t)sample;
-        voice.decoded_samples.push_back((int16_t)sample);
+        voice.sample_ring.push_back((int16_t)sample);
     }
 
     voice.stop_after_block = end && !loop;
-    voice.next_block_addr = end && loop ? voice.loop_start
-                                        : (uint16_t)(block_addr + 9);
+    if (end && loop) {
+        uint16_t next_addr = voice.loop_start;
+        bool reset_predictor = false;
+        if (voice.loop_start != voice.source_start &&
+            isLikelyBlankLoop(voice.loop_start) &&
+            !isLikelyBlankLoop(voice.source_start)) {
+            if (voice.recovered_loop_start != 0) {
+                next_addr = voice.recovered_loop_start;
+                reset_predictor = voice.recovered_loop_reset_predictor;
+            } else {
+                next_addr = resolveLoopStart(voice, reset_predictor);
+                voice.recovered_loop_start = next_addr;
+                voice.recovered_loop_reset_predictor = reset_predictor;
+            }
+            blank_loop_fallbacks++;
+        }
+        if (next_addr != voice.loop_start && reset_predictor) {
+            voice.reset_predictor_on_next_block = true;
+        }
+        voice.next_block_addr = next_addr;
+    } else {
+        voice.next_block_addr = (uint16_t)(block_addr + 9);
+    }
 
     if (end) {
         dsp_regs[0x7C] |= (uint8_t)(1u << voice_index);
@@ -775,7 +1030,7 @@ bool APU::decodeNextBlock(int voice_index) {
     return true;
 }
 
-int16_t APU::renderVoice(int voice_index) {
+int16_t APU::renderVoice(int voice_index, int pitch_mod_source_output) {
     Voice& voice = voices[voice_index];
     const int base = voice_index << 4;
     if (voice.key_on_pending) {
@@ -808,7 +1063,7 @@ int16_t APU::renderVoice(int voice_index) {
 
     while (voice.active &&
            !voice.stop_after_block &&
-           voice.sample_index >= (int)voice.decoded_samples.size()) {
+           voice.sample_index >= (int)voice.sample_ring.size()) {
         if (!decodeNextBlock(voice_index)) {
             voice.active = false;
             dsp_regs[base + 8] = 0;
@@ -817,7 +1072,7 @@ int16_t APU::renderVoice(int voice_index) {
         }
     }
 
-    if (voice.sample_index >= (int)voice.decoded_samples.size()) {
+    if (voice.sample_index >= (int)voice.sample_ring.size()) {
         voice.active = false;
         voice.releasing = true;
         voice.envelope = 0;
@@ -826,9 +1081,10 @@ int16_t APU::renderVoice(int voice_index) {
         return 0;
     }
 
-    auto sampleAt = [&voice](int index) {
-        index = clampIndex(index, 0, (int)voice.decoded_samples.size() - 1);
-        return voice.decoded_samples[(std::size_t)index];
+    auto sampleAt = [&voice](int index) -> int16_t {
+        if (voice.sample_ring.empty()) return 0;
+        index = clampIndex(index, 0, voice.sample_ring.size() - 1);
+        return voice.sample_ring[index];
     };
 
     const auto& gaussian = GaussianTable();
@@ -842,13 +1098,15 @@ int16_t APU::renderVoice(int voice_index) {
     interpolated += (gaussian[0x0FF - offset] * s0) >> 11;
     interpolated += (gaussian[0x1FF - offset] * s1) >> 11;
     interpolated += (gaussian[0x100 + offset] * s2) >> 11;
+    interpolated = (int16_t)interpolated;
     interpolated += (gaussian[0x000 + offset] * s3) >> 11;
 
     const bool noise_enabled = (dsp_regs[0x3D] & (1u << voice_index)) != 0;
-    int sample = noise_enabled ? (int)signExtend15((uint16_t)noise_lfsr & 0x7FFF)
-                               : (clamp16(interpolated) & ~1);
+    int sample = noise_enabled
+        ? clamp16((int)signExtend15((uint16_t)noise_lfsr & 0x7FFF) * 2)
+        : (clamp16(interpolated) & ~1);
     voice.current_sample = (int16_t)sample;
-    const int voice_output = clamp16((sample * (int)voice.envelope) >> 11);
+    const int voice_output = clamp16((sample * (int)voice.envelope) >> 11) & ~1;
     voice.last_output = (int16_t)voice_output;
 
     dsp_regs[base + 8] = (uint8_t)std::min(0xFF, (int)(voice.envelope >> 4));
@@ -857,19 +1115,29 @@ int16_t APU::renderVoice(int voice_index) {
     int pitch = (int)((uint16_t)dsp_regs[base + 2] |
                       ((uint16_t)(dsp_regs[base + 3] & 0x3F) << 8));
     if (voice_index > 0 && (dsp_regs[0x2D] & (1u << voice_index)) != 0) {
-        const int prev_outx = (int8_t)dsp_regs[((voice_index - 1) << 4) + 9];
-        pitch += (((prev_outx >> 5) * pitch) >> 10);
+        pitch += ((pitch_mod_source_output >> 5) * pitch) >> 10;
     }
-    pitch = std::clamp(pitch, 0, 0x3FFF);
+    pitch = std::max(0, pitch);
 
-    voice.interp_index = (uint16_t)(voice.interp_index + pitch);
+    if (voice.stop_after_block) {
+        voice.releasing = true;
+        voice.envelope_mode = EnvelopeMode::Release;
+        voice.envelope = 0;
+        voice.hidden_envelope = 0;
+    }
+
+    int next_interp = (voice.interp_index & 0x3FFF) + pitch;
+    if (next_interp > 0x7FFF) {
+        next_interp = 0x7FFF;
+    }
+    voice.interp_index = (uint16_t)next_interp;
     while (voice.interp_index >= 0x1000 && voice.active) {
         voice.interp_index -= 0x1000;
         voice.sample_index++;
 
         while (voice.active &&
                !voice.stop_after_block &&
-               voice.sample_index >= (int)voice.decoded_samples.size()) {
+               voice.sample_index >= (int)voice.sample_ring.size()) {
             if (!decodeNextBlock(voice_index)) {
                 voice.active = false;
                 dsp_regs[base + 8] = 0;
@@ -879,7 +1147,7 @@ int16_t APU::renderVoice(int voice_index) {
         }
 
         if (voice.stop_after_block &&
-            voice.sample_index >= (int)voice.decoded_samples.size()) {
+            voice.sample_index >= (int)voice.sample_ring.size()) {
             voice.active = false;
             voice.releasing = true;
             voice.envelope = 0;
@@ -890,8 +1158,7 @@ int16_t APU::renderVoice(int voice_index) {
 
         if (voice.sample_index > 24) {
             const int trim = voice.sample_index - 24;
-            voice.decoded_samples.erase(voice.decoded_samples.begin(),
-                                        voice.decoded_samples.begin() + trim);
+            voice.sample_ring.erase_front(trim);
             voice.sample_index -= trim;
         }
     }
@@ -905,6 +1172,248 @@ int16_t APU::readSample16(uint16_t address) const {
     return (int16_t)((uint16_t)lo | ((uint16_t)hi << 8));
 }
 
+bool APU::isLikelyBlankLoop(uint16_t address) const {
+    for (int block = 0; block < 3; block++) {
+        const uint16_t block_addr = (uint16_t)(address + block * 9);
+        for (int byte_index = 0; byte_index < 9; byte_index++) {
+            if (ram[(uint16_t)(block_addr + byte_index)] != 0) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool APU::isUsableLoopTarget(uint16_t address) const {
+    if (isLikelyBlankLoop(address)) {
+        return false;
+    }
+
+    uint16_t block_addr = address;
+    for (int block = 0; block < 8; block++) {
+        const uint8_t header = ram[block_addr];
+        bool all_zero = header == 0;
+        for (int byte_index = 1; byte_index < 9; byte_index++) {
+            if (ram[(uint16_t)(block_addr + byte_index)] != 0) {
+                all_zero = false;
+                break;
+            }
+        }
+        if (all_zero) {
+            return false;
+        }
+
+        const bool loop = (header & 0x02) != 0;
+        const bool end = (header & 0x01) != 0;
+        if (end) {
+            return loop;
+        }
+
+        block_addr = (uint16_t)(block_addr + 9);
+    }
+
+    return true;
+}
+
+bool APU::decodeCandidateSamples(uint16_t address, int16_t prev1, int16_t prev2,
+    std::array<int16_t, 8>& out_samples) const {
+    out_samples.fill(0);
+    if (isLikelyBlankLoop(address)) {
+        return false;
+    }
+
+    const uint8_t header = ram[address];
+    const uint8_t range = header >> 4;
+    const uint8_t filter = (header >> 2) & 0x03;
+    for (std::size_t i = 0; i < out_samples.size(); i++) {
+        const uint8_t packed = ram[(uint16_t)(address + 1 + (i >> 1))];
+        int nibble = ((i & 1) == 0) ? (packed >> 4) : (packed & 0x0F);
+        if (nibble & 0x08) {
+            nibble -= 16;
+        }
+        const int sample = decodeBrrSample(nibble, range, filter, prev1, prev2);
+        prev2 = prev1;
+        prev1 = (int16_t)sample;
+        out_samples[i] = (int16_t)sample;
+    }
+    return true;
+}
+
+int APU::scoreLoopCandidate(const Voice& voice, uint16_t address, uint16_t requested_loop,
+    bool reset_predictor) const {
+    const int16_t seed_prev1 = reset_predictor ? 0 : voice.prev1;
+    const int16_t seed_prev2 = reset_predictor ? 0 : voice.prev2;
+    std::array<int16_t, 128> preview{};
+    int preview_count = 0;
+    int16_t prev1 = seed_prev1;
+    int16_t prev2 = seed_prev2;
+    uint16_t block_addr = address;
+    while (preview_count < (int)preview.size()) {
+        const uint8_t header = ram[block_addr];
+        const uint8_t range = header >> 4;
+        const uint8_t filter = (header >> 2) & 0x03;
+        const bool loop = (header & 0x02) != 0;
+        const bool end = (header & 0x01) != 0;
+
+        for (int i = 0; i < 16 && preview_count < (int)preview.size(); i++) {
+            const uint8_t packed = ram[(uint16_t)(block_addr + 1 + (i >> 1))];
+            int nibble = ((i & 1) == 0) ? (packed >> 4) : (packed & 0x0F);
+            if (nibble & 0x08) {
+                nibble -= 16;
+            }
+            const int sample = decodeBrrSample(nibble, range, filter, prev1, prev2);
+            prev2 = prev1;
+            prev1 = (int16_t)sample;
+            preview[preview_count++] = (int16_t)sample;
+        }
+
+        if (end) {
+            if (!loop) {
+                break;
+            }
+            block_addr = address;
+        } else {
+            block_addr = (uint16_t)(block_addr + 9);
+        }
+    }
+
+    if (preview_count < 16) {
+        return std::numeric_limits<int>::max();
+    }
+
+    std::array<int16_t, 4> tail{};
+    const int tail_count = std::min(4, voice.sample_ring.size());
+    for (int i = 0; i < tail_count; i++) {
+        tail[4 - tail_count + i] = voice.sample_ring[voice.sample_ring.size() - tail_count + i];
+    }
+
+    int score = 0;
+    score += std::abs((int)preview[0] - (int)tail[3]);
+    score += std::abs(((int)preview[1] - (int)preview[0]) - ((int)tail[3] - (int)tail[2]));
+    score += std::abs(((int)preview[2] - (int)preview[1]) - ((int)tail[2] - (int)tail[1]));
+    score += std::abs(((int)preview[3] - (int)preview[2]) - ((int)tail[1] - (int)tail[0]));
+    score += std::abs((int)((address & 0x00FF) - (requested_loop & 0x00FF))) * 128;
+
+    int tail_energy = 0;
+    int lively_tail_samples = 0;
+    const int tail_start = std::max(0, preview_count - 32);
+    for (int i = tail_start; i < preview_count; i++) {
+        const int magnitude = std::abs((int)preview[i]);
+        tail_energy += magnitude;
+        if (magnitude > 1024) {
+            lively_tail_samples++;
+        }
+    }
+    score += std::max(0, 262144 - tail_energy);
+    score += std::max(0, 32 - lively_tail_samples) * 2048;
+
+    if ((address & 0xFF00) != (voice.source_start & 0xFF00)) {
+        score += 2048;
+    }
+    if ((ram[address] & 0x03) != 0x03) {
+        score += 8192;
+    }
+    if (reset_predictor) {
+        score += 128;
+    }
+    if (preview_count < (int)preview.size()) {
+        score += ((int)preview.size() - preview_count) * 256;
+    }
+
+    return score;
+}
+
+uint16_t APU::resolveLoopStart(const Voice& voice, bool& reset_predictor) const {
+    reset_predictor = false;
+    if (!isLikelyBlankLoop(voice.loop_start)) {
+        return voice.loop_start;
+    }
+
+    struct Candidate {
+        uint16_t address = 0;
+        int score = std::numeric_limits<int>::max();
+        bool reset = false;
+    };
+
+    Candidate best{};
+    bool have_candidate = false;
+    auto consider = [&](uint16_t candidate_addr, bool candidate_reset) {
+        if (!isUsableLoopTarget(candidate_addr)) {
+            return;
+        }
+        if (candidate_addr != voice.source_start &&
+            (ram[candidate_addr] & 0x03) != 0x03) {
+            return;
+        }
+        const int score = scoreLoopCandidate(voice, candidate_addr, voice.loop_start, candidate_reset);
+        if (!have_candidate || score < best.score) {
+            best.address = candidate_addr;
+            best.score = score;
+            best.reset = candidate_reset;
+            have_candidate = true;
+        }
+    };
+
+    consider(voice.source_start, true);
+
+    const uint16_t same_page_loop =
+        (uint16_t)((voice.source_start & 0xFF00) | (voice.loop_start & 0x00FF));
+    if (same_page_loop != voice.loop_start) {
+    consider(same_page_loop, true);
+    }
+
+    const uint16_t swapped_loop = (uint16_t)((voice.loop_start << 8) | (voice.loop_start >> 8));
+    if (swapped_loop != voice.loop_start) {
+        consider(swapped_loop, true);
+    }
+
+    const uint16_t source_page = (uint16_t)(voice.source_start & 0xFF00);
+    const int source_alignment = voice.source_start % 9;
+    for (int low = 0; low < 0x100; low++) {
+        const uint16_t candidate_addr = (uint16_t)(source_page | low);
+        if (candidate_addr == voice.source_start ||
+            candidate_addr == same_page_loop ||
+            candidate_addr == voice.loop_start) {
+            continue;
+        }
+        if ((candidate_addr % 9) != source_alignment) {
+            continue;
+        }
+        consider(candidate_addr, true);
+    }
+
+    const uint16_t directory_base = (uint16_t)(dsp_regs[0x5D] << 8);
+    for (int other_source = 0; other_source < 256; other_source++) {
+        if (other_source == voice.source_number) {
+            continue;
+        }
+        const uint16_t entry_addr = (uint16_t)(directory_base + other_source * 4);
+        const uint16_t other_start =
+            (uint16_t)ram[entry_addr] | ((uint16_t)ram[(uint16_t)(entry_addr + 1)] << 8);
+        if (other_start != voice.source_start) {
+            continue;
+        }
+
+        const uint16_t other_loop =
+            (uint16_t)ram[(uint16_t)(entry_addr + 2)] |
+            ((uint16_t)ram[(uint16_t)(entry_addr + 3)] << 8);
+        consider(other_loop, true);
+
+        const uint16_t other_swapped_loop = (uint16_t)((other_loop << 8) | (other_loop >> 8));
+        if (other_swapped_loop != other_loop) {
+            consider(other_swapped_loop, true);
+        }
+    }
+
+    if (!have_candidate) {
+        reset_predictor = true;
+        return voice.source_start;
+    }
+
+    reset_predictor = best.reset;
+    return best.address;
+}
+
 void APU::writeSample16(uint16_t address, int16_t sample) {
     ram[address] = (uint8_t)(sample & 0xFF);
     ram[(uint16_t)(address + 1)] = (uint8_t)(((uint16_t)sample >> 8) & 0xFF);
@@ -915,29 +1424,32 @@ void APU::synthesizeSamples(int spc_cycles) {
     while (sample_cycle_accumulator >= kSpcCyclesPerSample) {
         sample_cycle_accumulator -= kSpcCyclesPerSample;
         dsp_sample_counter++;
-        updateNoise();
-        dsp_key_poll_phase = !dsp_key_poll_phase;
-        if (!dsp_key_poll_phase) {
-            pollKeyStates();
+        if (--dsp_counter < 0) {
+            dsp_counter = kSimpleCounterRange - 1;
         }
+        updateNoise();
+        pollKeyStates();
 
         int mixed_left = 0;
         int mixed_right = 0;
         int echo_left = 0;
         int echo_right = 0;
+        int pitch_mod_source_output = 0;
         const uint8_t echo_enable = dsp_regs[0x4D];
         for (int voice_index = 0; voice_index < 8; voice_index++) {
             const int base = voice_index << 4;
-            const int voice_output = renderVoice(voice_index);
+            const int voice_output = renderVoice(voice_index, pitch_mod_source_output);
+            pitch_mod_source_output = voice_output;
+            const int audible_output = (voice_enable_mask & (1u << voice_index)) != 0 ? voice_output : 0;
             const int8_t vol_left = (int8_t)dsp_regs[base + 0];
             const int8_t vol_right = (int8_t)dsp_regs[base + 1];
-            const int voice_left = (voice_output * vol_left) >> 7;
-            const int voice_right = (voice_output * vol_right) >> 7;
-            mixed_left = clamp16(mixed_left + voice_left);
-            mixed_right = clamp16(mixed_right + voice_right);
+            const int voice_left = (audible_output * vol_left) >> 7;
+            const int voice_right = (audible_output * vol_right) >> 7;
+            mixed_left += voice_left;
+            mixed_right += voice_right;
             if ((echo_enable & (1u << voice_index)) != 0) {
-                echo_left = clamp16(echo_left + voice_left);
-                echo_right = clamp16(echo_right + voice_right);
+                echo_left += voice_left;
+                echo_right += voice_right;
             }
         }
 
@@ -957,7 +1469,7 @@ void APU::synthesizeSamples(int spc_cycles) {
         auto filterEcho = [this](const std::array<int16_t, 8>& history) {
             int filtered = 0;
             for (int tap = 0; tap < 8; tap++) {
-                const std::size_t index = (echo_history_pos + 8 - tap) & 7;
+                const std::size_t index = (echo_history_pos + 1 + tap) & 7;
                 const int8_t coeff = (int8_t)dsp_regs[0x0F + tap * 0x10];
                 filtered += ((int)history[index] * coeff) >> 7;
             }
@@ -966,8 +1478,8 @@ void APU::synthesizeSamples(int spc_cycles) {
 
         const int filtered_echo_left = filterEcho(echo_history_left);
         const int filtered_echo_right = filterEcho(echo_history_right);
-        mixed_left = clamp16(((mixed_left * master_left) >> 7) + ((filtered_echo_left * echo_vol_left) >> 7));
-        mixed_right = clamp16(((mixed_right * master_right) >> 7) + ((filtered_echo_right * echo_vol_right) >> 7));
+        mixed_left = ((mixed_left * master_left) >> 7) + ((filtered_echo_left * echo_vol_left) >> 7);
+        mixed_right = ((mixed_right * master_right) >> 7) + ((filtered_echo_right * echo_vol_right) >> 7);
 
         if ((dsp_regs[0x6C] & 0x20) == 0) {
             const int8_t echo_feedback = (int8_t)dsp_regs[0x0D];
@@ -983,7 +1495,11 @@ void APU::synthesizeSamples(int spc_cycles) {
         }
 
         echo_history_pos = (echo_history_pos + 1) & 7;
-        queueSample((int16_t)mixed_left, (int16_t)mixed_right);
+        const int16_t final_left = (int16_t)clamp16(mixed_left);
+        const int16_t final_right = (int16_t)clamp16(mixed_right);
+        last_mixed_left = final_left;
+        last_mixed_right = final_right;
+        queueSample(final_left, final_right);
     }
 }
 
@@ -1005,6 +1521,15 @@ int APU::stepInstruction() {
 
     const uint16_t instr_pc = pc;
     const uint8_t opcode = fetchByte();
+    current_instruction_pc = instr_pc;
+    current_instruction_opcode = opcode;
+    instruction_pc_history[instruction_history_pos] = instr_pc;
+    instruction_opcode_history[instruction_history_pos] = opcode;
+    instruction_a_history[instruction_history_pos] = a;
+    instruction_x_history[instruction_history_pos] = x;
+    instruction_y_history[instruction_history_pos] = y;
+    instruction_history_pos = (instruction_history_pos + 1) % kInstructionHistory;
+    instruction_history_filled = instruction_history_filled || instruction_history_pos == 0;
 
     auto branch = [this](bool take) -> int {
         int8_t rel = (int8_t)fetchByte();
@@ -1703,12 +2228,11 @@ int APU::stepInstruction() {
         uint8_t direct = fetchByte();
         uint16_t lhs = (uint16_t)a | ((uint16_t)y << 8);
         uint16_t rhs = readDirectWord(direct);
-        const uint32_t carry_in = getFlag(kFlagC) ? 1u : 0u;
-        uint32_t result = (uint32_t)lhs + rhs + carry_in;
-        uint16_t out = (uint16_t)result;
-        setFlag(kFlagC, result > 0xFFFF);
-        setFlag(kFlagH, ((lhs & 0x0FFF) + (rhs & 0x0FFF) + carry_in) > 0x0FFF);
-        setFlag(kFlagV, (~(lhs ^ rhs) & (lhs ^ out) & 0x8000) != 0);
+        setFlag(kFlagC, false);
+        const uint8_t low = adc8((uint8_t)lhs, (uint8_t)rhs);
+        const uint8_t high =
+            adc8((uint8_t)(lhs >> 8), (uint8_t)(rhs >> 8));
+        const uint16_t out = (uint16_t)low | ((uint16_t)high << 8);
         a = out & 0xFF;
         y = out >> 8;
         setNZ16(out);
@@ -1832,12 +2356,11 @@ int APU::stepInstruction() {
         uint8_t direct = fetchByte();
         uint16_t lhs = (uint16_t)a | ((uint16_t)y << 8);
         uint16_t rhs = readDirectWord(direct);
-        const int borrow = getFlag(kFlagC) ? 0 : 1;
-        int result = (int)lhs - rhs - borrow;
-        uint16_t out = (uint16_t)result;
-        setFlag(kFlagC, result >= 0);
-        setFlag(kFlagH, ((int)(lhs & 0x0FFF) - (int)(rhs & 0x0FFF) - borrow) >= 0);
-        setFlag(kFlagV, ((lhs ^ rhs) & (lhs ^ out) & 0x8000) != 0);
+        setFlag(kFlagC, true);
+        const uint8_t low = sbc8((uint8_t)lhs, (uint8_t)rhs);
+        const uint8_t high =
+            sbc8((uint8_t)(lhs >> 8), (uint8_t)(rhs >> 8));
+        const uint16_t out = (uint16_t)low | ((uint16_t)high << 8);
         a = out & 0xFF;
         y = out >> 8;
         setNZ16(out);

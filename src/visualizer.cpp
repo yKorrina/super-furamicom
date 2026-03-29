@@ -1,15 +1,21 @@
 #include "visualizer.hpp"
 
 #include "apu.hpp"
+#include "bus.hpp"
 #include "cpu.hpp"
 #include "ppu.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 namespace {
+constexpr int kPrettyGlyphWidth = 5;
+constexpr int kPrettyGlyphHeight = 7;
+constexpr int kPrettyGlyphAdvance = 6;
+
 static const uint32_t MINI_FONT[] = {
     0x000000,0x448400,0xAA0000,0xAEAEA0,0x4E6E40,0xA26480,0x4A4AC0,0x440000,
     0x248840,0x844820,0x0A4A00,0x04E400,0x000480,0x00E000,0x000040,0x224880,
@@ -25,7 +31,83 @@ static const uint32_t MINI_FONT[] = {
     0x0A44A0,0x0AA620,0x0E24E0,0x648460,0x444440,0xC424C0,0x05A000,0x000000,
 };
 
+struct PrettyGlyph {
+    char ch;
+    const char* rows[kPrettyGlyphHeight];
+};
+
+static const PrettyGlyph PRETTY_FONT[] = {
+    {'A', {" ### ","#   #","#   #","#####","#   #","#   #","#   #"}},
+    {'B', {"#### ","#   #","#   #","#### ","#   #","#   #","#### "}},
+    {'C', {" ### ","#   #","#    ","#    ","#    ","#   #"," ### "}},
+    {'D', {"#### ","#   #","#   #","#   #","#   #","#   #","#### "}},
+    {'E', {"#####","#    ","#    ","#### ","#    ","#    ","#####"}},
+    {'F', {"#####","#    ","#    ","#### ","#    ","#    ","#    "}},
+    {'G', {" ####","#    ","#    ","# ###","#   #","#   #"," ####"}},
+    {'H', {"#   #","#   #","#   #","#####","#   #","#   #","#   #"}},
+    {'I', {"#####","  #  ","  #  ","  #  ","  #  ","  #  ","#####"}},
+    {'J', {"#####","    #","    #","    #","#   #","#   #"," ### "}},
+    {'K', {"#   #","#  # ","# #  ","##   ","# #  ","#  # ","#   #"}},
+    {'L', {"#    ","#    ","#    ","#    ","#    ","#    ","#####"}},
+    {'M', {"#   #","## ##","# # #","# # #","#   #","#   #","#   #"}},
+    {'N', {"#   #","##  #","# # #","#  ##","#   #","#   #","#   #"}},
+    {'O', {" ### ","#   #","#   #","#   #","#   #","#   #"," ### "}},
+    {'P', {"#### ","#   #","#   #","#### ","#    ","#    ","#    "}},
+    {'Q', {" ### ","#   #","#   #","#   #","# # #","#  ##"," ####"}},
+    {'R', {"#### ","#   #","#   #","#### ","# #  ","#  # ","#   #"}},
+    {'S', {" ####","#    ","#    "," ### ","    #","    #","#### "}},
+    {'T', {"#####","  #  ","  #  ","  #  ","  #  ","  #  ","  #  "}},
+    {'U', {"#   #","#   #","#   #","#   #","#   #","#   #"," ### "}},
+    {'V', {"#   #","#   #","#   #","#   #","#   #"," # # ","  #  "}},
+    {'W', {"#   #","#   #","#   #","# # #","# # #","## ##","#   #"}},
+    {'X', {"#   #","#   #"," # # ","  #  "," # # ","#   #","#   #"}},
+    {'Y', {"#   #","#   #"," # # ","  #  ","  #  ","  #  ","  #  "}},
+    {'Z', {"#####","    #","   # ","  #  "," #   ","#    ","#####"}},
+    {'0', {" ### ","#   #","#  ##","# # #","##  #","#   #"," ### "}},
+    {'1', {"  #  "," ##  ","  #  ","  #  ","  #  ","  #  ","#####"}},
+    {'2', {" ### ","#   #","    #","   # ","  #  "," #   ","#####"}},
+    {'3', {" ### ","#   #","    #"," ### ","    #","#   #"," ### "}},
+    {'4', {"   # ","  ## "," # # ","#  # ","#####","   # ","   # "}},
+    {'5', {"#####","#    ","#    ","#### ","    #","#   #"," ### "}},
+    {'6', {" ### ","#   #","#    ","#### ","#   #","#   #"," ### "}},
+    {'7', {"#####","    #","   # ","  #  "," #   "," #   "," #   "}},
+    {'8', {" ### ","#   #","#   #"," ### ","#   #","#   #"," ### "}},
+    {'9', {" ### ","#   #","#   #"," ####","    #","#   #"," ### "}},
+    {'.', {"     ","     ","     ","     ","     "," ##  "," ##  "}},
+    {'/', {"    #","   # ","   # ","  #  "," #   "," #   ","#    "}},
+    {'-', {"     ","     ","     ","#####","     ","     ","     "}},
+    {':', {"     "," ##  "," ##  ","     "," ##  "," ##  ","     "}},
+    {'+', {"     ","  #  ","  #  ","#####","  #  ","  #  ","     "}},
+    {',', {"     ","     ","     ","     "," ##  "," ##  "," #   "}},
+    {'!', {"  #  ","  #  ","  #  ","  #  ","  #  ","     ","  #  "}},
+    {'?', {" ### ","#   #","    #","   # ","  #  ","     ","  #  "}},
+    {'(', {"   # ","  #  "," #   "," #   "," #   ","  #  ","   # "}},
+    {')', {" #   ","  #  ","   # ","   # ","   # ","  #  "," #   "}},
+    {' ', {"     ","     ","     ","     ","     ","     ","     "}},
+};
+
+const PrettyGlyph* findPrettyGlyph(char ch) {
+    for (const PrettyGlyph& glyph : PRETTY_FONT) {
+        if (glyph.ch == ch) return &glyph;
+    }
+    return nullptr;
+}
+
 void drawChar(uint32_t* pixels, int stride, int height, int cx, int cy, char ch, uint32_t color) {
+    if (const PrettyGlyph* glyph = findPrettyGlyph(ch)) {
+        for (int y = 0; y < kPrettyGlyphHeight; y++) {
+            for (int x = 0; x < kPrettyGlyphWidth; x++) {
+                if (glyph->rows[y][x] == ' ') continue;
+                const int px = cx + x;
+                const int py = cy + y;
+                if (px >= 0 && px < stride && py >= 0 && py < height) {
+                    pixels[py * stride + px] = color;
+                }
+            }
+        }
+        return;
+    }
+
     if (ch < 32 || ch > 127) return;
     const uint32_t glyph = MINI_FONT[ch - 32];
     for (int y = 0; y < 6; y++) {
@@ -39,11 +121,68 @@ void drawChar(uint32_t* pixels, int stride, int height, int cx, int cy, char ch,
         }
     }
 }
+
+bool pointInRect(int x, int y, const SDL_Rect& rect) {
+    return x >= rect.x && y >= rect.y && x < rect.x + rect.w && y < rect.y + rect.h;
+}
+
+SDL_Point logicalPointFromWindow(int logical_w, int logical_h, int x, int y) {
+    if (logical_w <= 0 || logical_h <= 0) return {-1, -1};
+    if (x < 0 || x >= logical_w || y < 0 || y >= logical_h) return {-1, -1};
+    return {x, y};
+}
+
+constexpr SDL_Rect kFullscreenButton{760, 20, 176, 30};
+constexpr std::array<SDL_Rect, 4> kTabRects = {{
+    SDL_Rect{24, 20, 88, 30},
+    SDL_Rect{124, 20, 88, 30},
+    SDL_Rect{224, 20, 88, 30},
+    SDL_Rect{324, 20, 88, 30},
+}};
+constexpr SDL_Rect kResolutionLabelRect{414, 80, 42, 12};
+constexpr std::array<SDL_Rect, 2> kResolutionRects = {{
+    SDL_Rect{464, 74, 52, 22},
+    SDL_Rect{522, 74, 52, 22},
+}};
+constexpr std::array<const char*, 2> kResolutionLabels = {{
+    "LOW",
+    "MID",
+}};
+constexpr uint32_t kVizBackground = 0xFF000000u;
+constexpr uint32_t kVizGrid = 0xFF050505u;
+constexpr uint32_t kVizPanelFill = 0xFF060606u;
+constexpr uint32_t kVizPanelAltFill = 0xFF0C0C0Cu;
+constexpr uint32_t kVizBorder = 0xFF808080u;
+constexpr uint32_t kVizBorderActive = 0xFFFFFFFFu;
+constexpr uint32_t kVizText = 0xFFFFFFFFu;
+constexpr uint32_t kVizTextSoft = 0xFFD8D8D8u;
+constexpr uint32_t kVizTextMuted = 0xFF9A9A9Au;
+constexpr uint32_t kVizAxis = 0xFF2A2A2Au;
+
+struct SpectrogramPreset {
+    int width;
+    int height;
+    int window_size;
+};
+
+SpectrogramPreset presetForResolution(Visualizer::SpectrogramResolution resolution) {
+    switch (resolution) {
+    case Visualizer::SpectrogramResolution::Low:
+        return {320, 180, 256};
+    case Visualizer::SpectrogramResolution::Medium:
+    default:
+        return {480, 224, 384};
+    }
+}
+
+const char* labelForResolution(Visualizer::SpectrogramResolution resolution) {
+    return kResolutionLabels[std::min<std::size_t>(1, (std::size_t)resolution)];
+}
 }
 
 Visualizer::Visualizer() {
-    pixels.fill(0xFF04030A);
-    spectrogram.fill(0xFF05030A);
+    pixels.fill(kVizBackground);
+    setSpectrogramResolution(SpectrogramResolution::Low);
 }
 
 Visualizer::~Visualizer() {
@@ -53,17 +192,21 @@ Visualizer::~Visualizer() {
 bool Visualizer::init() {
     window = SDL_CreateWindow("Super Furamicom Visualizer",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, SDL_WINDOW_HIDDEN);
+        WIN_W, WIN_H, SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE);
     if (!window) return false;
+    SDL_GetWindowPosition(window, &windowed_bounds.x, &windowed_bounds.y);
+    SDL_GetWindowSize(window, &windowed_bounds.w, &windowed_bounds.h);
+    SDL_SetWindowMinimumSize(window, MIN_W, MIN_H);
 
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     if (!renderer) {
         SDL_DestroyWindow(window);
         window = nullptr;
         return false;
     }
-
+    SDL_RenderSetLogicalSize(renderer, WIN_W, WIN_H);
+    refreshScaleMode();
     texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING, WIN_W, WIN_H);
     if (!texture) {
@@ -77,6 +220,27 @@ bool Visualizer::init() {
 void Visualizer::show() {
     if (!window) return;
     SDL_ShowWindow(window);
+}
+
+void Visualizer::setFullscreen(bool enable) {
+    if (!window || fullscreen == enable) return;
+
+    if (enable) {
+        SDL_GetWindowPosition(window, &windowed_bounds.x, &windowed_bounds.y);
+        SDL_GetWindowSize(window, &windowed_bounds.w, &windowed_bounds.h);
+        if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP) == 0) {
+            fullscreen = true;
+            refreshScaleMode();
+        }
+        return;
+    }
+
+    if (SDL_SetWindowFullscreen(window, 0) == 0) {
+        fullscreen = false;
+        SDL_SetWindowPosition(window, windowed_bounds.x, windowed_bounds.y);
+        SDL_SetWindowSize(window, windowed_bounds.w, windowed_bounds.h);
+        refreshScaleMode();
+    }
 }
 
 void Visualizer::placeBeside(SDL_Window* anchor, int gap) {
@@ -112,6 +276,7 @@ void Visualizer::placeBeside(SDL_Window* anchor, int gap) {
 }
 
 void Visualizer::destroy() {
+    fullscreen = false;
     if (texture) {
         SDL_DestroyTexture(texture);
         texture = nullptr;
@@ -139,6 +304,14 @@ bool Visualizer::processEvent(const SDL_Event& e) {
             destroy();
             return false;
         }
+        if (!fullscreen &&
+            (e.window.event == SDL_WINDOWEVENT_MOVED ||
+             e.window.event == SDL_WINDOWEVENT_RESIZED ||
+             e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)) {
+            SDL_GetWindowPosition(window, &windowed_bounds.x, &windowed_bounds.y);
+            SDL_GetWindowSize(window, &windowed_bounds.w, &windowed_bounds.h);
+            refreshScaleMode();
+        }
     }
 
     if (e.type == SDL_KEYDOWN && e.key.windowID == wid) {
@@ -146,16 +319,96 @@ bool Visualizer::processEvent(const SDL_Event& e) {
         case SDLK_1: active_panel = 0; break;
         case SDLK_2: active_panel = 1; break;
         case SDLK_3: active_panel = 2; break;
-        case SDLK_TAB: active_panel = (active_panel + 1) % 3; break;
+        case SDLK_4: active_panel = 3; break;
+        case SDLK_TAB: active_panel = (active_panel + 1) % 4; break;
+        case SDLK_MINUS:
+        case SDLK_KP_MINUS:
+            if (active_panel == 2) {
+                const int index = std::max(0, (int)spectrogram_resolution - 1);
+                setSpectrogramResolution((SpectrogramResolution)index);
+            }
+            break;
+        case SDLK_EQUALS:
+        case SDLK_KP_PLUS:
+            if (active_panel == 2) {
+                const int index = std::min(1, (int)spectrogram_resolution + 1);
+                setSpectrogramResolution((SpectrogramResolution)index);
+            }
+            break;
+        case SDLK_F11:
+            setFullscreen(!fullscreen);
+            break;
+        case SDLK_RETURN:
+            if ((e.key.keysym.mod & KMOD_ALT) != 0) {
+                setFullscreen(!fullscreen);
+            }
+            break;
         default: break;
+        }
+    }
+
+    if (e.type == SDL_MOUSEBUTTONDOWN &&
+        e.button.windowID == wid &&
+        e.button.button == SDL_BUTTON_LEFT) {
+        const SDL_Point point = toLogicalPoint(e.button.x, e.button.y);
+        if (point.x >= 0 && point.y >= 0) {
+            handleClick(point.x, point.y);
         }
     }
 
     return true;
 }
 
+SDL_Point Visualizer::toLogicalPoint(int window_x, int window_y) const {
+    return logicalPointFromWindow(WIN_W, WIN_H, window_x, window_y);
+}
+
+void Visualizer::handleClick(int x, int y) {
+    for (int i = 0; i < (int)kTabRects.size(); i++) {
+        if (pointInRect(x, y, kTabRects[(std::size_t)i])) {
+            active_panel = i;
+            return;
+        }
+    }
+
+    if (pointInRect(x, y, kFullscreenButton)) {
+        setFullscreen(!fullscreen);
+        return;
+    }
+
+    if (active_panel != 2) return;
+
+    for (int i = 0; i < (int)kResolutionRects.size(); i++) {
+        if (pointInRect(x, y, kResolutionRects[(std::size_t)i])) {
+            setSpectrogramResolution((SpectrogramResolution)i);
+            return;
+        }
+    }
+}
+
+void Visualizer::refreshScaleMode() {
+    if (!renderer || !window) return;
+    int window_w = 0;
+    int window_h = 0;
+    SDL_GetWindowSize(window, &window_w, &window_h);
+    const SDL_bool integer_scale = (window_w >= WIN_W && window_h >= WIN_H) ? SDL_TRUE : SDL_FALSE;
+    SDL_RenderSetIntegerScale(renderer, integer_scale);
+}
+
 float Visualizer::clamp01(float value) {
+    if (!std::isfinite(value)) return 0.0f;
     return std::clamp(value, 0.0f, 1.0f);
+}
+
+void Visualizer::setSpectrogramResolution(SpectrogramResolution resolution) {
+    spectrogram_resolution = resolution;
+    const SpectrogramPreset preset = presetForResolution(resolution);
+    spectrogram_w = preset.width;
+    spectrogram_h = preset.height;
+    spectrogram_window = preset.window_size;
+    spectrogram_head = 0;
+    last_audio_frame = 0;
+    spectrogram.assign((size_t)spectrogram_w * spectrogram_h, kVizBackground);
 }
 
 uint32_t Visualizer::lerpColor(uint32_t a, uint32_t b, float t) {
@@ -225,7 +478,7 @@ void Visualizer::drawRectOutline(int x, int y, int w, int h, uint32_t color) {
 void Visualizer::drawText(int x, int y, const char* text, uint32_t color) {
     if (!text) return;
     for (int i = 0; text[i] != '\0'; i++) {
-        drawChar(pixels.data(), WIN_W, WIN_H, x + i * 5, y, text[i], color);
+        drawChar(pixels.data(), WIN_W, WIN_H, x + i * kPrettyGlyphAdvance, y, text[i], color);
     }
 }
 
@@ -234,26 +487,20 @@ void Visualizer::clear(uint32_t color) {
 }
 
 void Visualizer::drawBackground() {
-    for (int y = 0; y < WIN_H; y++) {
-        const float t = (float)y / (float)(WIN_H - 1);
-        const uint32_t row_color = lerpColor(0xFF030209, 0xFF120412, t);
-        for (int x = 0; x < WIN_W; x++) {
-            pixels[(size_t)y * WIN_W + x] = row_color;
-        }
-    }
+    clear(kVizBackground);
 
     for (int y = 0; y < WIN_H; y += 4) {
-        drawRect(0, y, WIN_W, 1, 0x12000000);
+        drawRect(0, y, WIN_W, 1, kVizGrid);
     }
     for (int x = 0; x < WIN_W; x += 48) {
-        drawRect(x, 0, 1, WIN_H, 0x12000000);
+        drawRect(x, 0, 1, WIN_H, kVizGrid);
     }
 }
 
 void Visualizer::drawPanel(int x, int y, int w, int h, uint32_t fill, uint32_t border) {
     drawRect(x, y, w, h, fill);
     drawRectOutline(x, y, w, h, border);
-    drawRect(x, y, w, 2, lerpColor(border, 0xFFFFFFFFu, 0.25f));
+    drawRect(x, y, w, 2, border);
 }
 
 void Visualizer::drawPanelTitle(int x, int y, const char* text, uint32_t color) {
@@ -261,16 +508,24 @@ void Visualizer::drawPanelTitle(int x, int y, const char* text, uint32_t color) 
 }
 
 void Visualizer::drawTabs() {
-    static const char* labels[] = { "1 CPU", "2 PPU", "3 APU" };
-    for (int i = 0; i < 3; i++) {
-        const int tab_x = 24 + i * 112;
-        const uint32_t fill = i == active_panel ? 0xFF26081A : 0xFF120B19;
-        const uint32_t border = i == active_panel ? heatColor(0.72f) : 0xFF4D2C58;
-        drawPanel(tab_x, 20, 96, 30, fill, border);
-        drawText(tab_x + 14, 31, labels[i], i == active_panel ? 0xFFFFE9B4 : 0xFFBA8BC8);
+    static const char* labels[] = { "1 CPU", "2 PPU", "3 APU", "4 MEM" };
+    for (int i = 0; i < 4; i++) {
+        const uint32_t fill = i == active_panel ? kVizPanelAltFill : kVizPanelFill;
+        const uint32_t border = i == active_panel ? kVizBorderActive : kVizBorder;
+        const SDL_Rect rect = kTabRects[(std::size_t)i];
+        drawPanel(rect.x, rect.y, rect.w, rect.h, fill, border);
+        drawText(rect.x + 14, rect.y + 11, labels[i], kVizText);
     }
 
-    drawText(400, 31, "TAB CYCLES VIEWS", 0xFF9A6CA7);
+    drawText(428, 31, "TAB CYCLES VIEWS", kVizText);
+
+    const uint32_t fullscreen_fill = fullscreen ? kVizPanelAltFill : kVizPanelFill;
+    const uint32_t fullscreen_border = fullscreen ? kVizBorderActive : kVizBorder;
+    drawPanel(kFullscreenButton.x, kFullscreenButton.y, kFullscreenButton.w, kFullscreenButton.h,
+        fullscreen_fill, fullscreen_border);
+    drawText(kFullscreenButton.x + 16, kFullscreenButton.y + 11,
+        fullscreen ? "F11 WINDOWED" : "F11 FULLSCREEN",
+        kVizText);
 }
 
 void Visualizer::drawFramePreview(const PPU& ppu, int x, int y, int scale) {
@@ -327,7 +582,7 @@ void Visualizer::drawCPUHistoryPlot(const CPU& cpu, int x, int y, int w, int h) 
 
     for (int gy = 0; gy <= 4; gy++) {
         const int yy = y + (gy * (h - 1)) / 4;
-        drawRect(x, yy, w, 1, 0xFF28172C);
+        drawRect(x, yy, w, 1, kVizAxis);
     }
 
     drawTrace([&](size_t i) {
@@ -344,12 +599,104 @@ void Visualizer::drawCPUHistoryPlot(const CPU& cpu, int x, int y, int w, int h) 
     }, 0xFFFFE9B4, 1.0f);
 }
 
+void Visualizer::drawCPUAddressHeatmap(const CPU& cpu, int x, int y, int w, int h) {
+    const size_t count = cpu.hasHistoryWrapped() ? CPU::kDebugHistory : cpu.getHistoryPos();
+    if (count == 0 || w <= 0 || h <= 0) return;
+
+    std::array<uint16_t, 256 * 256> bins{};
+    bins.fill(0);
+    const size_t start = cpu.hasHistoryWrapped() ? cpu.getHistoryPos() : 0;
+    uint16_t max_hits = 0;
+    for (size_t i = 0; i < count; i++) {
+        const size_t idx = (start + i) % CPU::kDebugHistory;
+        const uint32_t pc = cpu.getPCHistory()[idx];
+        const int bank = (int)((pc >> 16) & 0xFF);
+        const int page = (int)((pc >> 8) & 0xFF);
+        uint16_t& slot = bins[(size_t)bank * 256 + (size_t)page];
+        if (slot < 0xFFFF) slot++;
+        max_hits = std::max(max_hits, slot);
+    }
+
+    for (int gy = 0; gy <= 4; gy++) {
+        const int yy = y + (gy * (h - 1)) / 4;
+        drawRect(x, yy, w, 1, kVizAxis);
+    }
+    for (int gx = 0; gx <= 4; gx++) {
+        const int xx = x + (gx * (w - 1)) / 4;
+        drawRect(xx, y, 1, h, kVizAxis);
+    }
+
+    for (int py = 0; py < h; py++) {
+        const int bank = std::clamp((py * 256) / std::max(1, h), 0, 255);
+        for (int px = 0; px < w; px++) {
+            const int page = std::clamp((px * 256) / std::max(1, w), 0, 255);
+            const uint16_t hits = bins[(size_t)bank * 256 + (size_t)page];
+            if (hits == 0) continue;
+            const float t = max_hits > 0 ? (float)hits / (float)max_hits : 0.0f;
+            putPixel(x + px, y + py, heatColor(0.08f + 0.92f * t));
+        }
+    }
+
+    const int current_bank = (cpu.getProgramCounter() >> 16) & 0xFF;
+    const int current_page = (cpu.getProgramCounter() >> 8) & 0xFF;
+    const int marker_x = x + (current_page * std::max(1, w - 1)) / 255;
+    const int marker_y = y + (current_bank * std::max(1, h - 1)) / 255;
+    drawRect(marker_x - 1, y, 3, h, 0xFFFFFFFFu);
+    drawRect(x, marker_y - 1, w, 3, 0xFFFFFFFFu);
+}
+
+void Visualizer::drawMemoryHeatmap(const uint8_t* data,
+                                   std::size_t size,
+                                   int bytes_per_row,
+                                   int x,
+                                   int y,
+                                   int w,
+                                   int h,
+                                   bool heat) {
+    if (!data || size == 0 || w <= 0 || h <= 0) return;
+    const int row_width = std::max(1, bytes_per_row);
+    const int rows = std::max(1, (int)((size + (std::size_t)row_width - 1) / (std::size_t)row_width));
+
+    for (int py = 0; py < h; py++) {
+        const int src_row = std::clamp((py * rows) / std::max(1, h), 0, rows - 1);
+        for (int px = 0; px < w; px++) {
+            const int src_col = std::clamp((px * row_width) / std::max(1, w), 0, row_width - 1);
+            const std::size_t index = std::min(size - 1, (std::size_t)src_row * (std::size_t)row_width + (std::size_t)src_col);
+            const float t = (float)data[index] / 255.0f;
+            putPixel(x + px, y + py, heat ? heatColor(t) : lerpColor(0xFF030303u, 0xFFFFFFFFu, t));
+        }
+    }
+}
+
+void Visualizer::drawLayerContributionBars(const PPU& ppu, int x, int y, int w, int h) {
+    static const char* labels[] = { "BD", "BG1", "BG2", "BG3", "BG4", "OBJL", "OBJH" };
+    const auto& main_counts = ppu.getFrameMainSourceCounts();
+    const auto& sub_counts = ppu.getFrameSubSourceCounts();
+    const uint32_t total_pixels = std::max<uint32_t>(1, 256u * 224u);
+    const int rows = 7;
+    const int row_h = std::max(14, h / rows);
+
+    for (int i = 0; i < rows; i++) {
+        const int cy = y + i * row_h;
+        const int label_x = x;
+        const int main_x = x + 46;
+        const int bar_w = std::max(24, w - 58);
+        const float main_fill = (float)main_counts[(std::size_t)i] / (float)total_pixels;
+        const float sub_fill = (float)sub_counts[(std::size_t)i] / (float)total_pixels;
+        drawText(label_x, cy + 2, labels[i], kVizText);
+        drawRect(main_x, cy + 1, bar_w, 7, kVizAxis);
+        drawRect(main_x, cy + 1, (int)(bar_w * main_fill), 7, heatColor(0.18f + 0.78f * main_fill));
+        drawRect(main_x, cy + 10, bar_w, 4, kVizAxis);
+        drawRect(main_x, cy + 10, (int)(bar_w * sub_fill), 4, 0xFF6EA8FFu);
+    }
+}
+
 void Visualizer::drawWaveform(const APU& apu, int x, int y, int w, int h) {
     const auto& history = apu.getRecentAudioMono();
     const size_t available = apu.hasRecentAudioHistory() ? history.size() : apu.getRecentAudioWritePos();
     if (available < 2) return;
 
-    drawRect(x, y + h / 2, w, 1, 0xFF321B33);
+    drawRect(x, y + h / 2, w, 1, kVizAxis);
 
     const size_t write_pos = apu.getRecentAudioWritePos();
     auto sampleAt = [&](size_t i) {
@@ -379,51 +726,53 @@ void Visualizer::drawWaveform(const APU& apu, int x, int y, int w, int h) {
 }
 
 void Visualizer::updateSpectrogram(const APU& apu) {
-    if (!apu.hasRecentAudioHistory()) return;
+    if (!apu.hasRecentAudioHistory() || spectrogram.empty() || spectrogram_w <= 0 || spectrogram_h <= 0) return;
     if (apu.getGeneratedAudioFrames() == last_audio_frame) return;
     last_audio_frame = apu.getGeneratedAudioFrames();
-
-    for (int row = 0; row < SPECTROGRAM_H; row++) {
-        std::memmove(&spectrogram[(size_t)row * SPECTROGRAM_W],
-            &spectrogram[(size_t)row * SPECTROGRAM_W + 1],
-            sizeof(uint32_t) * (SPECTROGRAM_W - 1));
-    }
 
     const auto& history = apu.getRecentAudioMono();
     const size_t hist_size = history.size();
     const size_t write_pos = apu.getRecentAudioWritePos();
-    constexpr int window_size = 256;
-    const float max_freq = (float)APU::kOutputHz * 0.5f;
+    const int window_size = std::min<int>(spectrogram_window, (int)hist_size);
+    if (window_size < 32) return;
+    const double max_freq = (double)APU::kOutputHz * 0.5;
 
-    for (int y = 0; y < SPECTROGRAM_H; y++) {
-        const float norm = 1.0f - ((float)y / (float)(SPECTROGRAM_H - 1));
-        const float freq = 30.0f * std::pow(max_freq / 30.0f, norm);
-        const float omega = 2.0f * 3.1415926535f * freq / (float)APU::kOutputHz;
-        const float coeff = 2.0f * std::cos(omega);
-        float s_prev = 0.0f;
-        float s_prev2 = 0.0f;
+    for (int y = 0; y < spectrogram_h; y++) {
+        const double norm = 1.0 - ((double)y / (double)std::max(1, spectrogram_h - 1));
+        const double freq = 30.0 * std::pow(max_freq / 30.0, norm);
+        const double omega = 2.0 * 3.14159265358979323846 * freq / (double)APU::kOutputHz;
+        const double coeff = 2.0 * std::cos(omega);
+        double s_prev = 0.0;
+        double s_prev2 = 0.0;
 
         for (int n = 0; n < window_size; n++) {
             const size_t idx = (write_pos + hist_size - window_size + n) % hist_size;
-            const float sample = (float)history[idx] / 32768.0f;
-            const float s = sample + coeff * s_prev - s_prev2;
+            const double sample = (double)history[idx] / 32768.0;
+            const double s = sample + coeff * s_prev - s_prev2;
             s_prev2 = s_prev;
             s_prev = s;
         }
 
-        const float power = s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
-        const float db = 10.0f * std::log10(1.0e-6f + power);
-        const float normalized = clamp01((db + 38.0f) / 28.0f);
-        spectrogram[(size_t)y * SPECTROGRAM_W + (SPECTROGRAM_W - 1)] = heatColor(normalized);
+        double power = s_prev2 * s_prev2 + s_prev * s_prev - coeff * s_prev * s_prev2;
+        if (!std::isfinite(power) || power < 0.0) {
+            power = 0.0;
+        }
+        const double db = power > 0.0 ? 10.0 * std::log10(power) : -120.0;
+        const float normalized = clamp01((float)((db + 38.0) / 28.0));
+        spectrogram[(size_t)y * spectrogram_w + spectrogram_head] = heatColor(normalized);
     }
+
+    spectrogram_head = (spectrogram_head + 1) % spectrogram_w;
 }
 
 void Visualizer::drawSpectrogram(int x, int y, int w, int h) {
+    if (spectrogram.empty() || spectrogram_w <= 0 || spectrogram_h <= 0) return;
     for (int py = 0; py < h; py++) {
-        const int src_y = std::clamp((py * SPECTROGRAM_H) / std::max(1, h), 0, SPECTROGRAM_H - 1);
+        const int src_y = std::clamp((py * spectrogram_h) / std::max(1, h), 0, spectrogram_h - 1);
         for (int px = 0; px < w; px++) {
-            const int src_x = std::clamp((px * SPECTROGRAM_W) / std::max(1, w), 0, SPECTROGRAM_W - 1);
-            putPixel(x + px, y + py, spectrogram[(size_t)src_y * SPECTROGRAM_W + src_x]);
+            const int sample_x = std::clamp((px * spectrogram_w) / std::max(1, w), 0, spectrogram_w - 1);
+            const int src_x = (spectrogram_head + sample_x) % spectrogram_w;
+            putPixel(x + px, y + py, spectrogram[(size_t)src_y * spectrogram_w + src_x]);
         }
     }
 }
@@ -440,21 +789,21 @@ void Visualizer::drawVoiceMeters(const APU& apu, int x, int y, int w, int h) {
         const int cy = y + 4 + (i / cols) * cell_h;
         const auto& voice = voices[i];
         drawPanel(cx, cy, cell_w - 6, cell_h - 6,
-            voice.active ? 0xFF140D1B : 0xFF0C0911,
-            voice.active ? heatColor(0.55f) : 0xFF34223F);
+            voice.active ? kVizPanelAltFill : kVizBackground,
+            voice.active ? kVizBorderActive : kVizBorder);
 
         char line[64];
         std::snprintf(line, sizeof(line), "V%d SRC:%02X P:%04X", i, voice.source_number, voice.pitch);
-        drawText(cx + 8, cy + 8, line, voice.active ? 0xFFFFE1B0 : 0xFF84678F);
+        drawText(cx + 8, cy + 8, line, kVizText);
 
         std::snprintf(line, sizeof(line), "ENV:%03X OUT:%02X", voice.envelope, voice.outx & 0xFF);
-        drawText(cx + 8, cy + 20, line, 0xFFCC97D6);
+        drawText(cx + 8, cy + 20, line, kVizText);
 
         const float env_fill = (float)voice.envelope / 2047.0f;
         const float out_fill = std::min(1.0f, std::abs((int)voice.last_output) / 32768.0f);
-        drawRect(cx + 8, cy + 34, cell_w - 24, 10, 0xFF170F1E);
+        drawRect(cx + 8, cy + 34, cell_w - 24, 10, kVizAxis);
         drawRect(cx + 8, cy + 34, (int)((cell_w - 24) * env_fill), 10, heatColor(env_fill));
-        drawRect(cx + 8, cy + 50, cell_w - 24, 8, 0xFF170F1E);
+        drawRect(cx + 8, cy + 50, cell_w - 24, 8, kVizAxis);
         drawRect(cx + 8, cy + 50, (int)((cell_w - 24) * out_fill), 8, heatColor(out_fill));
 
         char flags[32];
@@ -463,25 +812,25 @@ void Visualizer::drawVoiceMeters(const APU& apu, int x, int y, int w, int h) {
             voice.noise_enabled ? "NON " : "",
             voice.pitch_mod_enabled ? "PMON " : "",
             voice.volume_left, voice.volume_right);
-        drawText(cx + 8, cy + 64, flags, 0xFFA87BB8);
+        drawText(cx + 8, cy + 64, flags, kVizText);
     }
 }
 
 void Visualizer::drawCPUView(const CPU& cpu) {
-    drawPanel(24, 68, 288, 238, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(36, 80, "65816 CORE", 0xFFFFE9B4);
+    drawPanel(24, 68, 288, 238, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 80, "65816 CORE", kVizText);
 
     char line[128];
     std::snprintf(line, sizeof(line), "PC %06X  OP %02X", cpu.getProgramCounter(), cpu.getLastOpcode());
-    drawText(36, 102, line, 0xFFFFA54A);
+    drawText(36, 102, line, kVizText);
     std::snprintf(line, sizeof(line), "A %04X  X %04X  Y %04X", cpu.getA(), cpu.getX(), cpu.getY());
-    drawText(36, 116, line, 0xFFDDA0E6);
+    drawText(36, 116, line, kVizText);
     std::snprintf(line, sizeof(line), "SP %04X D %04X DB %02X", cpu.getSP(), cpu.getD(), cpu.getDB());
-    drawText(36, 130, line, 0xFFDDA0E6);
+    drawText(36, 130, line, kVizText);
     std::snprintf(line, sizeof(line), "P %02X  E %d  HALT %d", cpu.getP(), cpu.isEmulationMode() ? 1 : 0, cpu.isHalted() ? 1 : 0);
-    drawText(36, 144, line, 0xFFDDA0E6);
+    drawText(36, 144, line, kVizText);
 
-    drawText(36, 176, "RECENT FLOW", 0xFFCC97D6);
+    drawText(36, 176, "RECENT FLOW", kVizText);
     const size_t count = cpu.hasHistoryWrapped() ? CPU::kDebugHistory : cpu.getHistoryPos();
     const size_t start = cpu.hasHistoryWrapped() ? cpu.getHistoryPos() : 0;
     const size_t show = std::min<size_t>(8, count);
@@ -489,129 +838,208 @@ void Visualizer::drawCPUView(const CPU& cpu) {
         const size_t idx = (start + count - show + i) % CPU::kDebugHistory;
         std::snprintf(line, sizeof(line), "%06X A%04X X%04X Y%04X",
             cpu.getPCHistory()[idx], cpu.getAHistory()[idx], cpu.getXHistory()[idx], cpu.getYHistory()[idx]);
-        drawText(36, 190 + (int)i * 12, line, 0xFFB886C0);
+        drawText(36, 190 + (int)i * 12, line, kVizText);
     }
 
-    drawPanel(328, 68, 608, 238, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(340, 80, "EXECUTION TRACE", 0xFFFFE9B4);
+    drawPanel(328, 68, 608, 238, kVizPanelFill, kVizBorder);
+    drawPanelTitle(340, 80, "EXECUTION TRACE", kVizText);
     drawCPUHistoryPlot(cpu, 340, 104, 584, 186);
-    drawText(340, 286, "PC  A  X  Y", 0xFF8F6A99);
+    drawText(340, 286, "PC  A  X  Y", kVizText);
 
-    drawPanel(24, 328, 912, 368, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(36, 340, "CPU ACTIVITY MAP", 0xFFFFE9B4);
-    drawCPUHistoryPlot(cpu, 36, 364, 888, 320);
+    drawPanel(24, 328, 912, 368, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 340, "BANK / PAGE EXECUTION HEATMAP", kVizText);
+    drawCPUAddressHeatmap(cpu, 36, 364, 888, 292);
+    std::snprintf(line, sizeof(line), "CURRENT BANK %02X  PAGE %02X  HISTORY %zu",
+        (cpu.getProgramCounter() >> 16) & 0xFF,
+        (cpu.getProgramCounter() >> 8) & 0xFF,
+        cpu.hasHistoryWrapped() ? CPU::kDebugHistory : cpu.getHistoryPos());
+    drawText(36, 666, line, kVizText);
+    drawText(36, 680, "X PAGE 00-FF  Y BANK 00-FF  HEAT SHOWS RECENT EXECUTION DENSITY", kVizTextMuted);
 }
 
 void Visualizer::drawPPUView(const PPU& ppu) {
-    drawPanel(24, 68, 560, 500, 0xFF09070F, 0xFF4E2A58);
-    drawPanelTitle(36, 80, "FRAME PREVIEW", 0xFFFFE9B4);
-    drawFramePreview(ppu, 36, 104, 2);
+    drawPanel(24, 68, 560, 500, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 80, "PPU MEMORY ATLAS", kVizText);
+    drawText(36, 98, "VRAM", kVizText);
+    drawMemoryHeatmap(ppu.getVRAMData(), ppu.getVRAMSize(), 256, 36, 112, 536, 272, true);
+    drawText(36, 398, "OAM", kVizText);
+    drawMemoryHeatmap(ppu.getOAMData(), ppu.getOAMSize(), 32, 36, 412, 248, 120, false);
+    drawText(310, 398, "CGRAM", kVizText);
+    drawMemoryHeatmap(ppu.getCGRAMData(), ppu.getCGRAMSize(), 32, 310, 412, 250, 30, false);
+    drawPaletteStrip(ppu, 310, 450, 7, 16);
 
-    drawPanel(608, 68, 328, 248, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(620, 80, "PPU STATE", 0xFFFFE9B4);
+    drawPanel(608, 68, 328, 248, kVizPanelFill, kVizBorder);
+    drawPanelTitle(620, 80, "PPU STATE", kVizText);
 
     char line[128];
     std::snprintf(line, sizeof(line), "MODE %d  INIDISP %02X", ppu.getBGMode() & 0x07, ppu.getINIDISP());
-    drawText(620, 102, line, 0xFFFFA54A);
+    drawText(620, 102, line, kVizText);
     std::snprintf(line, sizeof(line), "TM %02X TS %02X TMW %02X TSW %02X",
         ppu.getTMMain(), ppu.getTMSub(), ppu.getTMW(), ppu.getTSW());
-    drawText(620, 116, line, 0xFFDDA0E6);
+    drawText(620, 116, line, kVizText);
     std::snprintf(line, sizeof(line), "CGWSEL %02X CGADSUB %02X FIX %04X",
         ppu.getCGWSEL(), ppu.getCGADSUB(), ppu.getFixedColor());
-    drawText(620, 130, line, 0xFFDDA0E6);
+    drawText(620, 130, line, kVizText);
     std::snprintf(line, sizeof(line), "W12 %02X W34 %02X WOBJ %02X",
         ppu.getW12SEL(), ppu.getW34SEL(), ppu.getWOBJSEL());
-    drawText(620, 144, line, 0xFFDDA0E6);
+    drawText(620, 144, line, kVizText);
     std::snprintf(line, sizeof(line), "WH %02X %02X %02X %02X",
         ppu.getWH0(), ppu.getWH1(), ppu.getWH2(), ppu.getWH3());
-    drawText(620, 158, line, 0xFFDDA0E6);
+    drawText(620, 158, line, kVizText);
     std::snprintf(line, sizeof(line), "WLOG %02X OBJLOG %02X",
         ppu.getWBGLOG(), ppu.getWOBJLOG());
-    drawText(620, 172, line, 0xFFDDA0E6);
+    drawText(620, 172, line, kVizText);
     std::snprintf(line, sizeof(line), "VRAM %zu  CGRAM %zu  OAM %zu",
         ppu.countNonZeroVRAM(), ppu.countNonZeroCGRAM(), ppu.countNonZeroOAM());
-    drawText(620, 186, line, 0xFFDDA0E6);
+    drawText(620, 186, line, kVizText);
     std::snprintf(line, sizeof(line), "PIXELS %zu  VBL %d",
         ppu.countNonBlackPixels(), ppu.getVBlank() ? 1 : 0);
-    drawText(620, 200, line, 0xFFDDA0E6);
+    drawText(620, 200, line, kVizText);
 
     for (int bg = 0; bg < 4; bg++) {
         std::snprintf(line, sizeof(line), "BG%d SC %02X HOFS %04X VOFS %04X",
             bg + 1, ppu.getBGSC(bg), ppu.getBGHOFS(bg), ppu.getBGVOFS(bg));
-        drawText(620, 224 + bg * 12, line, 0xFFB886C0);
+        drawText(620, 224 + bg * 12, line, kVizText);
     }
 
-    drawPanel(608, 340, 328, 228, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(620, 352, "CGRAM", 0xFFFFE9B4);
-    drawPaletteStrip(ppu, 620, 376, 18, 16);
+    drawPanel(608, 340, 328, 228, kVizPanelFill, kVizBorder);
+    drawPanelTitle(620, 352, "SCREEN SOURCE MIX", kVizText);
+    drawLayerContributionBars(ppu, 620, 376, 304, 172);
+    std::snprintf(line, sizeof(line), "COLMATH %u  BLACKWIN %u",
+        ppu.getFrameColorMathPixels(), ppu.getFrameBlackWindowPixels());
+    drawText(620, 556, line, kVizText);
 
-    drawPanel(24, 588, 912, 108, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(36, 600, "LAYER AND WINDOW DIAGNOSTICS", 0xFFFFE9B4);
+    drawPanel(24, 588, 912, 108, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 600, "LAYER AND WINDOW DIAGNOSTICS", kVizText);
     std::snprintf(line, sizeof(line), "BG12NBA %02X BG34NBA %02X VMAIN %02X VRAM %04X CGRAM %02X OAM %04X",
         ppu.getBGNBA(0), ppu.getBGNBA(1), ppu.getVMAIN(),
         ppu.getVRAMAddress(), ppu.getCGRAMAddress(), ppu.getOAMAddress());
-    drawText(36, 624, line, 0xFFDDA0E6);
+    drawText(36, 624, line, kVizText);
+    drawText(36, 638, "MAIN BARS = MAIN SCREEN  SMALL BARS = SUB SCREEN", kVizTextMuted);
 }
 
 void Visualizer::drawAPUView(const APU& apu) {
     updateSpectrogram(apu);
 
-    drawPanel(24, 68, 620, 276, 0xFF09070F, 0xFF4E2A58);
-    drawPanelTitle(36, 80, "LIVE SPECTROGRAM", 0xFFFFE9B4);
+    drawPanel(24, 68, 620, 276, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 80, "LIVE SPECTROGRAM", kVizText);
+    drawText(kResolutionLabelRect.x, kResolutionLabelRect.y, "RES", kVizText);
+    for (int i = 0; i < (int)kResolutionRects.size(); i++) {
+        const bool active = i == (int)spectrogram_resolution;
+        const SDL_Rect rect = kResolutionRects[(std::size_t)i];
+        drawPanel(rect.x, rect.y, rect.w, rect.h,
+            active ? kVizPanelAltFill : kVizPanelFill,
+            active ? kVizBorderActive : kVizBorder);
+        drawText(rect.x + 12, rect.y + 8, kResolutionLabels[(std::size_t)i],
+            kVizText);
+    }
     drawSpectrogram(36, 104, 596, 224);
 
-    drawPanel(24, 360, 620, 172, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(36, 372, "WAVEFORM", 0xFFFFE9B4);
+    drawPanel(24, 360, 620, 172, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 372, "WAVEFORM", kVizText);
     drawWaveform(apu, 36, 396, 596, 120);
 
-    drawPanel(668, 68, 268, 190, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(680, 80, "SPC700 STATE", 0xFFFFE9B4);
+    drawPanel(668, 68, 268, 190, kVizPanelFill, kVizBorder);
+    drawPanelTitle(680, 80, "SPC700 STATE", kVizText);
 
     char line[160];
     std::snprintf(line, sizeof(line), "PC %04X A %02X X %02X Y %02X",
         apu.getSPCPC(), apu.getSPCA(), apu.getSPCX(), apu.getSPCY());
-    drawText(680, 102, line, 0xFFFFA54A);
+    drawText(680, 102, line, kVizText);
     std::snprintf(line, sizeof(line), "SP %02X PSW %02X DSP %02X",
         apu.getSPCSP(), apu.getSPCPSW(), apu.getDSPAddress());
-    drawText(680, 116, line, 0xFFDDA0E6);
+    drawText(680, 116, line, kVizText);
     std::snprintf(line, sizeof(line), "CTRL %02X TEST %02X NOISE %04X",
         apu.getControlReg(), apu.getTestReg(), (uint16_t)apu.getNoiseSample() & 0xFFFF);
-    drawText(680, 130, line, 0xFFDDA0E6);
+    drawText(680, 130, line, kVizText);
     std::snprintf(line, sizeof(line), "UP %d BYTES %zu EXEC %04X",
         apu.hasUploadedProgram() ? 1 : 0, apu.getUploadedBytes(), apu.getExecuteAddress());
-    drawText(680, 144, line, 0xFFDDA0E6);
+    drawText(680, 144, line, kVizText);
     std::snprintf(line, sizeof(line), "READY %d RUN %d BAD %d",
         apu.isDriverReady() ? 1 : 0, apu.isUserCodeRunning() ? 1 : 0, apu.hasUnsupportedOpcode() ? 1 : 0);
-    drawText(680, 158, line, 0xFFDDA0E6);
+    drawText(680, 158, line, kVizText);
     std::snprintf(line, sizeof(line), "FRAMES %llu ACTIVE %llu",
         (unsigned long long)apu.getGeneratedAudioFrames(),
         (unsigned long long)apu.getNonZeroAudioFrames());
-    drawText(680, 172, line, 0xFFDDA0E6);
+    drawText(680, 172, line, kVizText);
     std::snprintf(line, sizeof(line), "PEAK %d KON %02X FLG %02X",
         apu.getAudioPeakSample(), apu.getDSPRegister(0x4C), apu.getDSPRegister(0x6C));
-    drawText(680, 186, line, 0xFFDDA0E6);
+    drawText(680, 186, line, kVizText);
+    std::snprintf(line, sizeof(line), "SPEC %s %dx%d",
+        labelForResolution(spectrogram_resolution), spectrogram_w, spectrogram_h);
+    drawText(680, 200, line, kVizText);
 
-    drawPanel(668, 276, 268, 256, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(680, 288, "VOICE METERS", 0xFFFFE9B4);
+    drawPanel(668, 276, 268, 256, kVizPanelFill, kVizBorder);
+    drawPanelTitle(680, 288, "VOICE METERS", kVizText);
     drawVoiceMeters(apu, 676, 304, 252, 220);
 
-    drawPanel(24, 548, 912, 148, 0xFF0E0914, 0xFF4E2A58);
-    drawPanelTitle(36, 560, "PORTS AND TIMERS", 0xFFFFE9B4);
+    drawPanel(24, 548, 912, 148, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 560, "PORTS AND TIMERS", kVizText);
 
     const auto& cpu_ports = apu.getCpuToSPCPorts();
     const auto& spc_ports = apu.getSPCToCpuPorts();
     std::snprintf(line, sizeof(line), "CPU->SPC %02X %02X %02X %02X    SPC->CPU %02X %02X %02X %02X",
         cpu_ports[0], cpu_ports[1], cpu_ports[2], cpu_ports[3],
         spc_ports[0], spc_ports[1], spc_ports[2], spc_ports[3]);
-    drawText(36, 586, line, 0xFFDDA0E6);
+    drawText(36, 586, line, kVizText);
 
     const auto timers = apu.getTimerDebug();
     for (int i = 0; i < 3; i++) {
         std::snprintf(line, sizeof(line), "T%d EN %d TARGET %02X ST2 %02X ST3 %02X DIV %d PERIOD %d",
             i, timers[i].enabled ? 1 : 0, timers[i].target, timers[i].stage2,
             timers[i].stage3, timers[i].divider, timers[i].period);
-        drawText(36, 606 + i * 14, line, 0xFFB886C0);
+        drawText(36, 606 + i * 14, line, kVizText);
     }
+}
+
+void Visualizer::drawMemoryView(const CPU& cpu, const PPU& ppu, const APU& apu) {
+    const Bus* bus = cpu.getBus();
+    const uint8_t* wram = bus ? bus->getWRAMData() : nullptr;
+    const std::size_t wram_size = bus ? bus->getWRAMSize() : 0;
+
+    drawPanel(24, 68, 560, 308, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 80, "WRAM 128K", kVizText);
+    drawMemoryHeatmap(wram, wram_size, 256, 36, 104, 536, 248, true);
+
+    drawPanel(608, 68, 328, 308, kVizPanelFill, kVizBorder);
+    drawPanelTitle(620, 80, "APU RAM 64K", kVizText);
+    drawMemoryHeatmap(apu.getRAMData(), 64 * 1024, 256, 620, 104, 304, 248, true);
+
+    drawPanel(24, 396, 560, 300, kVizPanelFill, kVizBorder);
+    drawPanelTitle(36, 408, "VRAM 64K", kVizText);
+    drawMemoryHeatmap(ppu.getVRAMData(), ppu.getVRAMSize(), 256, 36, 432, 536, 232, true);
+    char line[160];
+    std::snprintf(line, sizeof(line), "VRAM %04X  CGRAM %02X  OAM %04X",
+        ppu.getVRAMAddress(), ppu.getCGRAMAddress(), ppu.getOAMAddress());
+    drawText(36, 674, line, kVizText);
+
+    drawPanel(608, 396, 328, 140, kVizPanelFill, kVizBorder);
+    drawPanelTitle(620, 408, "OAM / CGRAM", kVizText);
+    drawText(620, 428, "OAM", kVizText);
+    drawMemoryHeatmap(ppu.getOAMData(), ppu.getOAMSize(), 32, 620, 442, 140, 76, false);
+    drawText(776, 428, "CGRAM", kVizText);
+    drawMemoryHeatmap(ppu.getCGRAMData(), ppu.getCGRAMSize(), 32, 776, 442, 148, 18, false);
+    drawPaletteStrip(ppu, 776, 456, 5, 16);
+
+    drawPanel(608, 556, 328, 140, kVizPanelFill, kVizBorder);
+    drawPanelTitle(620, 568, "POINTERS AND BUS", kVizText);
+    if (bus) {
+        std::snprintf(line, sizeof(line), "WRAMADDR %05X  OPEN %02X", (unsigned)bus->getWRAMAddress(), bus->getOpenBus());
+        drawText(620, 592, line, kVizText);
+        std::snprintf(line, sizeof(line), "JOY1 %04X  JOY2 %04X", bus->getJoy1AutoRead(), bus->getJoy2AutoRead());
+        drawText(620, 606, line, kVizText);
+        std::snprintf(line, sizeof(line), "4016R %llu  4016W %llu",
+            (unsigned long long)bus->getJoy4016Reads(),
+            (unsigned long long)bus->getJoy4016Writes());
+        drawText(620, 620, line, kVizText);
+    } else {
+        drawText(620, 592, "BUS DATA UNAVAILABLE", kVizTextMuted);
+    }
+    std::snprintf(line, sizeof(line), "SPC PC %04X  DSP %02X  FRAMES %llu",
+        apu.getSPCPC(), apu.getDSPAddress(), (unsigned long long)apu.getGeneratedAudioFrames());
+    drawText(620, 634, line, kVizText);
+    std::snprintf(line, sizeof(line), "CPU PC %06X  OP %02X", cpu.getProgramCounter(), cpu.getLastOpcode());
+    drawText(620, 648, line, kVizText);
 }
 
 void Visualizer::update(const CPU& cpu, const PPU& ppu, const APU& apu) {
@@ -628,12 +1056,18 @@ void Visualizer::update(const CPU& cpu, const PPU& ppu, const APU& apu) {
         drawPPUView(ppu);
         break;
     case 2:
+        drawAPUView(apu);
+        break;
+    case 3:
+        drawMemoryView(cpu, ppu, apu);
+        break;
     default:
         drawAPUView(apu);
         break;
     }
 
     SDL_UpdateTexture(texture, nullptr, pixels.data(), WIN_W * (int)sizeof(uint32_t));
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, nullptr, nullptr);
     SDL_RenderPresent(renderer);

@@ -31,6 +31,8 @@ struct LauncherResult {
     bool launch_requested = false;
     std::string rom_path;
     bool visualize = false;
+    bool manipulator = false;
+    bool integer_scaling = false;
     InputConfig input_config;
 };
 
@@ -40,6 +42,8 @@ LauncherResult RunLauncher(SDL_Window* window,
                            const std::vector<std::string>& rom_paths,
                            const std::string& controls_path,
                            const InputConfig& initial_config,
-                           bool visualize_default);
+                           bool visualize_default,
+                           bool manipulator_default,
+                           bool integer_scaling_default);
 
 #endif

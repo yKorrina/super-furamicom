@@ -1,31 +1,37 @@
 #include "bus.hpp"
 #include "apu.hpp"
 #include "cpu.hpp"
+#include "sa1.hpp"
 #include <iostream>
+
+namespace {
+constexpr int kAutoJoypadBusyCpuCycles = 352;
+}
 
 Bus::Bus(CPU* c, PPU* p, APU* a) : cpu(c), ppu(p), apu(a) {
     cpu->connectBus(this);
-    wram.resize(128 * 1024, 0); 
+    wram.resize(128 * 1024, 0);
     nmi_enabled = false;
     wram_address = 0;
+    resetDebugHistory();
 }
 
 void Bus::insertCartridge(Cartridge* cart) { cartridge = cart; }
 
 uint16_t Bus::encodeJoypadState(uint16_t state) {
     uint16_t encoded = 0;
-    if (state & 0x8000) encoded |= 0x8000; // B
-    if (state & 0x4000) encoded |= 0x4000; // Y
-    if (state & 0x2000) encoded |= 0x2000; // Select
-    if (state & 0x1000) encoded |= 0x1000; // Start
-    if (state & 0x0008) encoded |= 0x0800; // Up
-    if (state & 0x0004) encoded |= 0x0400; // Down
-    if (state & 0x0002) encoded |= 0x0200; // Left
-    if (state & 0x0001) encoded |= 0x0100; // Right
-    if (state & 0x0080) encoded |= 0x0080; // A
-    if (state & 0x0040) encoded |= 0x0040; // X
-    if (state & 0x0800) encoded |= 0x0020; // L
-    if (state & 0x0400) encoded |= 0x0010; // R
+    if (state & 0x8000) encoded |= 0x8000;
+    if (state & 0x4000) encoded |= 0x4000;
+    if (state & 0x2000) encoded |= 0x2000;
+    if (state & 0x1000) encoded |= 0x1000;
+    if (state & 0x0008) encoded |= 0x0800;
+    if (state & 0x0004) encoded |= 0x0400;
+    if (state & 0x0002) encoded |= 0x0200;
+    if (state & 0x0001) encoded |= 0x0100;
+    if (state & 0x0080) encoded |= 0x0080;
+    if (state & 0x0040) encoded |= 0x0040;
+    if (state & 0x0800) encoded |= 0x0020;
+    if (state & 0x0400) encoded |= 0x0010;
     return encoded;
 }
 
@@ -53,9 +59,10 @@ void Bus::beginFrame() {
             initializeHDMAChannel(i);
             if (!dma[i].hdma_terminated && dma[i].hdma_do_transfer) {
                 transferHDMAChannel(i);
-                dma[i].hdma_do_transfer = (dma[i].line_counter & 0x80) != 0;
+                dma[i].hdma_do_transfer = !dma[i].hdma_repeat;
             }
         } else {
+            dma[i].hdma_repeat = false;
             dma[i].hdma_do_transfer = false;
             dma[i].hdma_terminated = true;
             dma[i].line_counter = 0;
@@ -64,19 +71,47 @@ void Bus::beginFrame() {
 }
 
 void Bus::startVBlank() {
-    nmi_pending = true;
+    vblank_nmi_flag = true;
+    nmi_request_pending = nmi_enabled;
     if (nmitimen & 0x01) {
         auto_joypad_busy = true;
-        joy1_auto_read = encodeJoypadState(joy1_state);
-        joy2_auto_read = encodeJoypadState(joy2_state);
+        auto_joypad_cycles_remaining = kAutoJoypadBusyCpuCycles;
+        joy1_auto_read_latch = encodeJoypadState(joy1_state);
+        joy2_auto_read_latch = encodeJoypadState(joy2_state);
+        joy1_shift = joy1_auto_read_latch;
+        joy2_shift = joy2_auto_read_latch;
+    } else {
         auto_joypad_busy = false;
+        auto_joypad_cycles_remaining = 0;
     }
-    auto_joypad_busy = false;
 }
 
 void Bus::endVBlank() {
-    nmi_pending = false;
+    vblank_nmi_flag = false;
     auto_joypad_busy = false;
+    auto_joypad_cycles_remaining = 0;
+}
+
+void Bus::tick(int cpu_cycles) {
+    if (cartridge && cartridge->isLoaded()) {
+        cartridge->tickCoprocessors(cpu_cycles);
+        if (cartridge->consumeCoprocessorIRQ()) {
+            irq_flag = true;
+            irq_request_pending = true;
+        }
+    }
+
+    if (cpu_cycles <= 0 || !auto_joypad_busy) return;
+
+    auto_joypad_cycles_remaining -= cpu_cycles;
+    if (auto_joypad_cycles_remaining <= 0) {
+        auto_joypad_busy = false;
+        auto_joypad_cycles_remaining = 0;
+        joy1_auto_read = joy1_auto_read_latch;
+        joy2_auto_read = joy2_auto_read_latch;
+        joy1_shift = 0xFFFF;
+        joy2_shift = 0xFFFF;
+    }
 }
 
 void Bus::beginScanline(int scanline) {
@@ -84,7 +119,8 @@ void Bus::beginScanline(int scanline) {
     const uint8_t irq_mode = (nmitimen >> 4) & 0x03;
 
     if ((irq_mode == 2 || irq_mode == 3) && scanline == (int)(vtime & 0x01FF) && (htime & 0x01FF) == 0) {
-        irq_pending = true;
+        irq_flag = true;
+        irq_request_pending = true;
         irq_fired_this_scanline = true;
     }
 }
@@ -95,37 +131,40 @@ void Bus::beginHBlank(int scanline) {
     const uint8_t irq_mode = (nmitimen >> 4) & 0x03;
     switch (irq_mode) {
     case 1:
-        irq_pending = true;
+        irq_flag = true;
+        irq_request_pending = true;
         break;
     case 3:
         if (scanline == (int)(vtime & 0x01FF)) {
-            irq_pending = true;
+            irq_flag = true;
+            irq_request_pending = true;
         }
         break;
     default:
         break;
     }
 
-    if (irq_pending) {
+    if (irq_request_pending) {
         irq_fired_this_scanline = true;
     }
 }
 
 bool Bus::consumeNMI() {
-    if (!nmi_enabled || !nmi_pending) return false;
-    nmi_pending = false;
+    if (!nmi_request_pending) return false;
+    nmi_request_pending = false;
     return true;
 }
 
 bool Bus::consumeIRQ() {
-    if (!irq_pending) return false;
-    irq_pending = false;
+    if (!irq_request_pending) return false;
+    irq_request_pending = false;
     return true;
 }
 
 void Bus::initializeHDMAChannel(int channel) {
     dma[channel].table_address = (uint16_t)(dma[channel].src_address & 0xFFFF);
     dma[channel].line_counter = 0;
+    dma[channel].hdma_repeat = false;
     dma[channel].hdma_do_transfer = false;
     dma[channel].hdma_terminated = false;
     reloadHDMALineCounter(channel);
@@ -135,13 +174,24 @@ void Bus::reloadHDMALineCounter(int channel) {
     DMAChannel& ch = dma[channel];
     const uint8_t table_bank = (uint8_t)((ch.src_address >> 16) & 0xFF);
     const uint32_t base = ((uint32_t)table_bank << 16) | ch.table_address;
-    ch.line_counter = read(base);
+    const uint8_t raw_line_counter = read(base);
     ch.table_address++;
 
-    if (ch.line_counter == 0) {
+    if (raw_line_counter == 0) {
+        if (ch.control & 0x40) {
+            ch.table_address += 2;
+        }
         ch.hdma_terminated = true;
+        ch.hdma_repeat = false;
         ch.hdma_do_transfer = false;
+        ch.line_counter = 0;
         return;
+    }
+
+    ch.hdma_repeat = (raw_line_counter & 0x80) != 0;
+    ch.line_counter = (uint8_t)(raw_line_counter & 0x7F);
+    if (ch.line_counter == 0) {
+        ch.line_counter = 128;
     }
 
     if (ch.control & 0x40) {
@@ -200,17 +250,18 @@ void Bus::stepHDMA() {
         DMAChannel& ch = dma[i];
         if (ch.hdma_terminated) continue;
 
-        const bool repeat_mode = (ch.line_counter & 0x80) != 0;
-        if (ch.hdma_do_transfer) transferHDMAChannel(i);
+        if (ch.hdma_do_transfer) {
+            transferHDMAChannel(i);
+        }
 
-        uint8_t remaining = ch.line_counter & 0x7F;
-        if (remaining > 0) remaining--;
+        if (ch.line_counter > 0) {
+            ch.line_counter--;
+        }
 
-        if (remaining == 0) {
+        if (ch.line_counter == 0) {
             reloadHDMALineCounter(i);
         } else {
-            ch.line_counter = (uint8_t)((repeat_mode ? 0x80 : 0x00) | remaining);
-            ch.hdma_do_transfer = repeat_mode;
+            ch.hdma_do_transfer = !ch.hdma_repeat;
         }
     }
 }
@@ -218,8 +269,8 @@ void Bus::stepHDMA() {
 void Bus::setJoypadState(uint16_t pad1, uint16_t pad2) {
     joy1_state = pad1;
     joy2_state = pad2;
-    joy1_auto_read = encodeJoypadState(joy1_state);
-    joy2_auto_read = encodeJoypadState(joy2_state);
+    joy1_auto_read_latch = encodeJoypadState(joy1_state);
+    joy2_auto_read_latch = encodeJoypadState(joy2_state);
     if (joypad_strobe) {
         latchJoypads();
     }
@@ -231,8 +282,36 @@ void Bus::saveSRAM() {
     }
 }
 
+void Bus::resetDebugHistory() {
+    apu_port_write_history.fill(APUPortWriteDebug{});
+    apu_port_write_history_pos = 0;
+    apu_port_write_history_filled = false;
+    apu_port_write_sequence = 0;
+}
+
 void Bus::handleAPUWrite(uint8_t port, uint8_t data) {
     if (apu) {
+        APUPortWriteDebug& entry = apu_port_write_history[apu_port_write_history_pos];
+        entry.sequence = ++apu_port_write_sequence;
+        entry.cpu_pc = cpu ? cpu->getProgramCounter() : 0;
+        entry.a = cpu ? cpu->getA() : 0;
+        entry.x = cpu ? cpu->getX() : 0;
+        entry.y = cpu ? cpu->getY() : 0;
+        entry.sp = cpu ? cpu->getSP() : 0;
+        entry.d = cpu ? cpu->getD() : 0;
+        entry.db = cpu ? cpu->getDB() : 0;
+        entry.p = cpu ? cpu->getP() : 0;
+        entry.opcode = cpu ? cpu->getLastOpcode() : 0;
+        const uint16_t direct_page_base = cpu ? cpu->getD() : 0;
+        entry.dp0 = wram[direct_page_base & 0xFFFF];
+        entry.dp1 = wram[(direct_page_base + 1) & 0xFFFF];
+        entry.dp2 = wram[(direct_page_base + 2) & 0xFFFF];
+        entry.port = port & 0x03;
+        entry.data = data;
+        apu_port_write_history_pos =
+            (apu_port_write_history_pos + 1) % apu_port_write_history.size();
+        apu_port_write_history_filled =
+            apu_port_write_history_filled || apu_port_write_history_pos == 0;
         apu->writePort(port, data);
     }
 }
@@ -250,6 +329,17 @@ uint8_t Bus::read(uint32_t address) {
         if (offset >= 0x2140 && offset <= 0x217F) {
             return apu ? apu->readPort((offset - 0x2140) & 0x03) : 0x00;
         }
+        if (offset >= 0x2200 && offset <= 0x23FF) {
+            if (cartridge && cartridge->hasSA1()) {
+                return cartridge->getSA1()->snesRead(offset);
+            }
+        }
+        if (offset >= 0x3000 && offset <= 0x32FF) {
+            if (cartridge && cartridge->hasSuperFX()) {
+                return cartridge->readCoprocessorRegister(offset);
+            }
+            return open_bus;
+        }
         if (offset == 0x2180) {
             uint8_t val = wram[wram_address % wram.size()];
             wram_address = (wram_address + 1) & 0x01FFFF;
@@ -264,13 +354,14 @@ uint8_t Bus::read(uint32_t address) {
             return (uint8_t)(0x1C | readJoypadSerial(1));
         }
         if (offset == 0x4210) {
-            const uint8_t value = (nmi_pending ? 0x80 : 0x00) | 0x02;
-            nmi_pending = false;
+            const uint8_t value = (vblank_nmi_flag ? 0x80 : 0x00) | 0x02;
+            vblank_nmi_flag = false;
             return value;
         }
         if (offset == 0x4211) {
-            const uint8_t value = irq_pending ? 0x80 : 0x00;
-            irq_pending = false;
+            const uint8_t value = irq_flag ? 0x80 : 0x00;
+            irq_flag = false;
+            irq_request_pending = false;
             return value;
         }
         if (offset == 0x4212) {
@@ -327,6 +418,18 @@ void Bus::write(uint32_t address, uint8_t data) {
         if (offset < 0x2000) { wram[offset] = data; return; }
         if (offset >= 0x2100 && offset <= 0x213F) { ppu->writeRegister(offset, data); return; }
         if (offset >= 0x2140 && offset <= 0x217F) { handleAPUWrite((offset - 0x2140) & 0x03, data); return; }
+        if (offset >= 0x2200 && offset <= 0x23FF) {
+            if (cartridge && cartridge->hasSA1()) {
+                cartridge->getSA1()->snesWrite(offset, data);
+                return;
+            }
+        }
+        if (offset >= 0x3000 && offset <= 0x32FF) {
+            if (cartridge && cartridge->hasSuperFX()) {
+                cartridge->writeCoprocessorRegister(offset, data);
+            }
+            return;
+        }
         if (offset == 0x2180) { wram[wram_address % wram.size()] = data; wram_address = (wram_address + 1) & 0x01FFFF; return; }
         if (offset == 0x2181) { wram_address = (wram_address & 0x01FF00) | data; return; }
         if (offset == 0x2182) { wram_address = (wram_address & 0x0100FF) | ((uint32_t)data << 8); return; }
@@ -342,10 +445,15 @@ void Bus::write(uint32_t address, uint8_t data) {
             return;
         }
         if (offset == 0x4200) {
+            const bool old_nmi_enabled = nmi_enabled;
             nmitimen = data;
             nmi_enabled = (data & 0x80) != 0;
+            if (!old_nmi_enabled && nmi_enabled && vblank_nmi_flag) {
+                nmi_request_pending = true;
+            }
             if ((data & 0x30) == 0) {
-                irq_pending = false;
+                irq_flag = false;
+                irq_request_pending = false;
             }
             return;
         }
@@ -392,34 +500,21 @@ void Bus::write(uint32_t address, uint8_t data) {
     if (cartridge && cartridge->isLoaded()) cartridge->write(address, data);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  DMA — Fixed bank wrapping
-//
-//  CRITICAL FIX: On real SNES hardware, during a DMA transfer the A-bus
-//  source address only increments/decrements the LOW 16 BITS.  The bank
-//  byte stays fixed for the entire transfer.  If the offset wraps from
-//  $FFFF it goes to $0000 in the SAME bank, NOT the next bank.
-//
-//  Our old code was doing dma[i].src_address++ on the full 24-bit value,
-//  which would cross bank boundaries and read garbage data from the
-//  wrong ROM/RAM bank.  This is THE cause of garbled tile graphics.
-// ═══════════════════════════════════════════════════════════════════════════
 void Bus::executeDMA(uint8_t channels) {
     for (int i = 0; i < 8; i++) {
         if ((channels & (1 << i)) == 0) continue;
-        
+
         uint8_t mode = dma[i].control & 0x07;
         bool direction = (dma[i].control & 0x80) != 0;
         bool fixed     = (dma[i].control & 0x08) != 0;
         bool decrement = (dma[i].control & 0x10) != 0;
-        
+
         int transfer_size = (dma[i].size == 0) ? 0x10000 : dma[i].size;
         uint16_t bytes_transferred = 0;
-        
-        // Separate bank and offset — bank stays fixed!
+
         uint8_t  src_bank   = (dma[i].src_address >> 16) & 0xFF;
         uint16_t src_offset = dma[i].src_address & 0xFFFF;
-        
+
         while (transfer_size > 0) {
             uint16_t b_reg = 0x2100 + dma[i].dest_reg;
             switch (mode) {
@@ -433,27 +528,23 @@ void Bus::executeDMA(uint8_t channels) {
                 case 7: b_reg += ((bytes_transferred >> 1) & 1); break;
                 default: break;
             }
-            
-            // Build full address from fixed bank + current offset
+
             uint32_t src_full = ((uint32_t)src_bank << 16) | src_offset;
-            
+
             if (!direction)
                 write(b_reg, read(src_full));
             else
                 write(src_full, read(b_reg));
-            
-            // Only adjust the 16-bit offset, bank stays fixed
+
             if (!fixed) {
                 if (decrement) src_offset--;
                 else           src_offset++;
-                // src_offset naturally wraps as uint16_t
             }
-            
+
             transfer_size--;
             bytes_transferred++;
         }
-        
-        // Write back the final address state
+
         dma[i].src_address = ((uint32_t)src_bank << 16) | src_offset;
         dma[i].size = 0;
     }

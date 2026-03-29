@@ -18,7 +18,7 @@ public:
         OpcodeFunc   operate;
         AddrModeFunc addrmode;
         uint8_t      cycles;
-        const char*  name;   // Mnemonic for trace log
+        const char*  name;
     };
 
     CPU();
@@ -30,10 +30,8 @@ public:
     void nmi();
     void irq();
 
-    // Diagnostic trace — call before loading ROM to enable
     void enableTrace(const std::string& path, uint64_t max_lines = 500000);
 
-    // Check if CPU is halted (STP/WAI/infinite loop detection)
     bool isHalted() const { return halted; }
     uint32_t getProgramCounter() const { return ((uint32_t)PB << 16) | PC; }
     uint16_t getA() const { return A; }
@@ -51,6 +49,7 @@ public:
     const std::array<uint16_t, kDebugHistory>& getYHistory() const { return y_history; }
     std::size_t getHistoryPos() const { return history_pos; }
     bool hasHistoryWrapped() const { return history_filled; }
+    const Bus* getBus() const { return bus; }
 
 private:
     Bus* bus;
@@ -95,7 +94,6 @@ private:
     uint8_t  pop8 ();
     uint16_t pop16();
 
-    // ── Addressing Modes ──────────────────────────────────────────────────────
     void IMP();
     void ACC();
     void IMM8();
@@ -120,7 +118,6 @@ private:
     void REL();
     void REL16();
 
-    // ── Opcodes ───────────────────────────────────────────────────────────────
     void LDA(); void LDX(); void LDY();
     void STA(); void STX(); void STY(); void STZ();
 
@@ -184,4 +181,4 @@ private:
     void buildInstructionTable();
 };
 
-#endif // CPU_HPP
+#endif
