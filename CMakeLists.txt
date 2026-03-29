@@ -21,3 +21,7 @@ target_link_libraries(snes_emu ${SDL2_LIBRARIES})
 if(TARGET SDL2::SDL2)
     target_link_libraries(snes_emu SDL2::SDL2)
 endif()
+
+if(WIN32)
+    target_link_libraries(snes_emu gdi32)
+endif()
