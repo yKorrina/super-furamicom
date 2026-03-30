@@ -14,6 +14,8 @@ find_package(SDL2 REQUIRED)
 
 file(GLOB SOURCES "src/*.cpp")
 add_executable(snes_emu ${SOURCES})
+set(BUILD_NUMBER 0 CACHE STRING "Embedded build number")
+target_compile_definitions(snes_emu PRIVATE BUILD_NUMBER=${BUILD_NUMBER})
 
 target_include_directories(snes_emu PRIVATE src ${SDL2_INCLUDE_DIRS})
 target_link_libraries(snes_emu ${SDL2_LIBRARIES})
